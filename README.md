@@ -1,4 +1,4 @@
-# EWFGO - 纯Go实现的EWF取证镜像解析库
+# EWFGO - 纯Go实现的EWF取证镜像解析库(开发中)
 
 EWFGO是一个纯Go实现的Expert Witness Format (EWF) 取证镜像解析库，可以用于读取和分析EWF格式的磁盘镜像文件（例如EnCase的.E01文件）。
 
