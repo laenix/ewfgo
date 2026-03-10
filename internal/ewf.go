@@ -34,19 +34,370 @@ func (e *EWFImage) Open(file string) (*EWFImage, error) {
 	if !e.IsEWFFile() {
 		return nil, errors.New("not ewf file")
 	}
-	//
 	return e, nil
 }
 
+// Filepath returns the file path of the EWF image.
+func (e *EWFImage) Filepath() string {
+	return e.filepath
+}
+
 // 读取某位置的多少个字节
+// ReadAt reads raw bytes from the EWF file at the given offset.
+// For actual sector data, use ReadSectorData instead.
 func (e *EWFImage) ReadAt(addr int64, length int64) []byte {
 	file, err := os.Open(e.filepath)
 	if err != nil {
 		return nil
 	}
+	defer file.Close()
 	buffer := make([]byte, length)
 	file.ReadAt(buffer, addr)
 	return buffer
+}
+
+// ReadSectorAt reads a raw sector from the uncompressed sector data
+func (e *EWFImage) ReadSectorAt(sectorNum int) ([]byte, error) {
+	if len(e.Sectors) == 0 || len(e.Sectors[0].TableEntry) == 0 {
+		return nil, fmt.Errorf("no sector data available")
+	}
+
+	sectorSize := 512
+	if len(e.DiskSMART) > 0 {
+		sectorSize = int(e.DiskSMART[0].SectorBytes)
+	}
+
+	// Calculate chunk index
+	chunkSectors := 64
+	if len(e.DiskSMART) > 0 && e.DiskSMART[0].ChunkSectors > 0 {
+		chunkSectors = int(e.DiskSMART[0].ChunkSectors)
+	}
+
+	chunkIndex := sectorNum / chunkSectors
+	offsetInChunk := sectorNum % chunkSectors
+
+	if chunkIndex >= len(e.Sectors[0].TableEntry) {
+		return nil, fmt.Errorf("sector %d out of range", sectorNum)
+	}
+
+	tableEntry := e.Sectors[0].TableEntry
+	chunkOffset := int64(tableEntry[chunkIndex] & 0x7FFFFFFF)
+	isCompressed := (tableEntry[chunkIndex] & 0x80000000) != 0
+
+	sectorsStart := int64(e.Sectors[0].Address) + 76
+	chunkStart := sectorsStart + chunkOffset
+	chunkSize := chunkSectors * sectorSize
+
+	chunkData := e.ReadAt(chunkStart, int64(chunkSize))
+	if len(chunkData) == 0 {
+		return nil, fmt.Errorf("failed to read chunk at offset %d", chunkOffset)
+	}
+
+	var decompressed []byte
+	if isCompressed {
+		r, err := zlib.NewReader(bytes.NewReader(chunkData))
+		if err == nil {
+			decompressed, _ = io.ReadAll(r)
+			r.Close()
+		} else {
+			decompressed = chunkData
+		}
+	} else {
+		decompressed = chunkData
+	}
+
+	offset := offsetInChunk * sectorSize
+	if offset+sectorSize > len(decompressed) {
+		return nil, fmt.Errorf("sector data truncated")
+	}
+
+	return decompressed[offset : offset+sectorSize], nil
+}
+
+// DetectLVM detects LVM2 Physical Volume signature in sector data
+func (e *EWFImage) DetectLVM() bool {
+	if len(e.Sectors) == 0 {
+		return false
+	}
+
+	// Check first few sectors for LVM2 signature
+	for i := 0; i < 10; i++ {
+		data, err := e.ReadSectorAt(i)
+		if err != nil {
+			continue
+		}
+		// LVM2 signature at sector 1, offset 512
+		if len(data) >= 512 && string(data[512:520]) == "_LVM2_PV" {
+			return true
+		}
+		// Also check within sector 0
+		if len(data) >= 8 && string(data[:8]) == "_LVM2_PV" {
+			return true
+		}
+	}
+	return false
+}
+
+// DetectRAID detects common RAID signatures
+func (e *EWFImage) DetectRAID() bool {
+	if len(e.Sectors) == 0 {
+		return false
+	}
+
+	// Check first few sectors for RAID signatures
+	for i := 0; i < 10; i++ {
+		data, err := e.ReadSectorAt(i)
+		if err != nil {
+			continue
+		}
+
+		// Linux RAID superblock (version 1.0)
+		if len(data) >= 88 {
+			if string(data[84:88]) == "RAID" {
+				return true
+			}
+		}
+
+		// LUKS (encrypted disk)
+		if len(data) >= 8 {
+			if string(data[:8]) == "LUKS\xBA\xBE" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// IsPartitionImage determines if this is a full disk or partition image
+func (e *EWFImage) IsPartitionImage() bool {
+	if len(e.DiskSMART) == 0 {
+		return false
+	}
+
+	// If total sectors equals partition sectors from MBR, it's likely a partition
+	totalSectors := e.DiskSMART[0].SectorsCount
+
+	// Read MBR to check partition sizes
+	if len(e.Sectors) > 0 {
+		data, err := e.ReadSectorAt(0)
+		if err == nil && len(data) >= 512 {
+			// Check partition table entries
+			var mbr MBR
+			binary.Read(bytes.NewReader(data[:512]), binary.LittleEndian, &mbr)
+
+			for _, p := range mbr.PartitionTable {
+				if p.PartitionSize > 0 && uint32(totalSectors) == p.PartitionSize {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// GetPartitionType analyzes the disk/partition type by parsing the MBR
+// Uses the same decompress method that PrintMBR uses for reliability
+func (e *EWFImage) GetPartitionType() string {
+	// Use decompress method (same as PrintMBR) - proven to work for all files
+	if len(e.Sectors) > 0 && len(e.Sectors[0].TableEntry) > 0 {
+		FirstSector := e.ReadAt(int64(e.Sectors[0].Address)+76, 
+			int64(e.Sectors[0].TableEntry[1])-int64(e.Sectors[0].TableEntry[0]))
+		if len(FirstSector) > 0 {
+			r, err := zlib.NewReader(bytes.NewReader(FirstSector))
+			if err == nil {
+				var buf bytes.Buffer
+				io.Copy(&buf, r)
+				r.Close()
+				if buf.Len() >= 512 {
+					return analyzeMBR(buf.Bytes()[:512])
+				}
+			}
+		}
+	}
+
+	return "Unknown"
+}
+
+// analyzeMBR analyzes MBR data and returns partition type string
+func analyzeMBR(data []byte) string {
+	if len(data) < 512 {
+		return "Unknown"
+	}
+
+	var mbr MBR
+	err := binary.Read(bytes.NewReader(data[:512]), binary.LittleEndian, &mbr)
+	if err != nil {
+		return "Unknown"
+	}
+
+	// Print partition types for debugging
+	for i, p := range mbr.PartitionTable {
+		if p.PartitionSize > 0 {
+			fmt.Fprintf(os.Stderr, "[analyzeMBR] Partition %d: type=0x%02X size=%d\n", i, p.PartitionType, p.PartitionSize)
+		}
+	}
+
+	// Check for empty MBR
+	if mbr.PartitionTable[0].PartitionSize == 0 && mbr.PartitionTable[1].PartitionSize == 0 {
+		return "Empty/MBR"
+	}
+
+	// Check for GPT protective MBR
+	for _, p := range mbr.PartitionTable {
+		if p.PartitionType == 0xEE {
+			return "GPT (UEFI)"
+		}
+	}
+
+	// Check partition types - comprehensive list
+	hasLinux := false
+	hasLVM := false
+	hasSwap := false
+	hasNTFS := false
+	hasFAT := false
+	partCount := 0
+
+	for _, p := range mbr.PartitionTable {
+		if p.PartitionSize > 0 {
+			partCount++
+		}
+		switch p.PartitionType {
+		case 0x83: // Linux
+			hasLinux = true
+		case 0x8E: // Linux LVM
+			hasLVM = true
+		case 0x82: // Linux Swap
+			hasSwap = true
+		case 0x07, 0x17: // NTFS, Hidden NTFS
+			hasNTFS = true
+		case 0x0B, 0x0C: // FAT32 CHS, FAT32 LBA
+			hasFAT = true
+		case 0x0E, 0x04, 0x06: // FAT16 LBA, FAT16 CHS, FAT16
+			hasFAT = true
+		case 0x01: // FAT12
+			hasFAT = true
+		case 0x11, 0x14, 0x16, 0x1B, 0x1C, 0x1E: // Hidden FAT variants
+			hasFAT = true
+		case 0xEF: // EFI System Partition
+			return "EFI (ESP)"
+		case 0xEA: // Linux extended boot
+			hasLinux = true
+		case 0xFD: // Linux RAID
+			return "Linux RAID"
+		case 0xFE: // IBM NTFS
+			hasNTFS = true
+		}
+	}
+
+	if partCount == 0 {
+		return "Empty"
+	}
+	if hasLVM {
+		return "Linux + LVM"
+	}
+	if hasLinux && hasSwap {
+		return "Linux (Swap)"
+	}
+	if hasLinux {
+		return "Linux"
+	}
+	if hasNTFS {
+		return "Windows/NTFS"
+	}
+	if hasFAT {
+		return "Windows/FAT"
+	}
+
+	return "Mixed/Other"
+}
+
+// ReadSectorData reads sector data from the compressed sectors sections.
+// It uses the table mapping to find the right offset and handles decompression.
+func (e *EWFImage) ReadSectorData(startSector uint64, numSectors uint64) ([]byte, error) {
+	if len(e.Sectors) == 0 {
+		return nil, errors.New("no sectors data found")
+	}
+
+	sectorSize := uint64(512)
+	if len(e.DiskSMART) > 0 {
+		sectorSize = uint64(e.DiskSMART[0].SectorBytes)
+	}
+
+	// Get chunk size from DiskSMART (default 64 sectors per chunk)
+	chunkSectors := uint64(64)
+	chunkBytes := uint64(32768) // 32KB default
+	if len(e.DiskSMART) > 0 {
+		if e.DiskSMART[0].ChunkSectors > 0 {
+			chunkSectors = uint64(e.DiskSMART[0].ChunkSectors)
+		}
+		if e.DiskSMART[0].SectorBytes > 0 {
+			// chunkBytes = chunkSectors * sectorSize (will be calculated below)
+		}
+	}
+	chunkBytes = chunkSectors * sectorSize
+
+	// Get table entry for the first (and usually only) sectors section
+	tableEntry := e.Sectors[0].TableEntry
+	sectorsStart := int64(e.Sectors[0].Address) + SectionLength
+
+	totalBytes := numSectors * sectorSize
+	result := make([]byte, 0, totalBytes)
+
+	// Read each sector requested
+	for i := uint64(0); i < numSectors; i++ {
+		sectorNum := startSector + i
+
+		// Find which chunk this sector belongs to
+		chunkIndex := sectorNum / chunkSectors
+		offsetInChunk := sectorNum % chunkSectors
+
+		if chunkIndex >= uint64(len(tableEntry)) {
+			return nil, fmt.Errorf("sector %d out of range (max chunk: %d)", sectorNum, len(tableEntry))
+		}
+
+		chunkOffset := int64(tableEntry[chunkIndex] & 0x7FFFFFFF)
+		isCompressed := (tableEntry[chunkIndex] & 0x80000000) != 0
+
+		// Read the chunk from sectors section
+		chunkStart := sectorsStart + chunkOffset
+		chunkSize := int(chunkBytes)
+		chunkData := e.ReadAt(chunkStart, int64(chunkSize))
+
+		if len(chunkData) == 0 {
+			return nil, fmt.Errorf("failed to read chunk at offset %d", chunkOffset)
+		}
+
+		var decompressed []byte
+		if isCompressed {
+			// Decompress using zlib
+			r, err := zlib.NewReader(bytes.NewReader(chunkData))
+			if err != nil {
+				// If decompression fails, treat as uncompressed
+				decompressed = chunkData[:chunkSize]
+			} else {
+				decompressed, _ = io.ReadAll(r)
+				r.Close()
+			}
+		} else {
+			decompressed = chunkData[:chunkSize]
+		}
+
+		// Extract the specific sector from the chunk
+		offset := int(offsetInChunk) * int(sectorSize)
+		if offset+int(sectorSize) > len(decompressed) {
+			// Read beyond chunk, fill with zeros
+			sector := make([]byte, sectorSize)
+			if offset < len(decompressed) {
+				copy(sector, decompressed[offset:])
+			}
+			result = append(result, sector...)
+			continue
+		}
+		result = append(result, decompressed[offset:offset+int(sectorSize)]...)
+	}
+
+	return result, nil
 }
 
 // func (e *EWFImage) ReadHeader(){

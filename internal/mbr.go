@@ -74,9 +74,9 @@ func PrintMBR(mbr MBR) {
 		case 0x83:
 			fmt.Print(" (Linux)\n")
 		case 0xEE:
-			fmt.Print(" (GPT保护分区)\n")
+			fmt.Print(" (GPT Protective)\n")
 		default:
-			fmt.Print(" (其他类型)\n")
+			fmt.Print(" (Other)\n")
 		}
 		fmt.Printf("  EndCHS: %02X %02X %02X\n",
 			entry.EndCHS[0], entry.EndCHS[1], entry.EndCHS[2])
@@ -84,11 +84,11 @@ func PrintMBR(mbr MBR) {
 		fmt.Printf("  PartitionSize: %d sectors\n", entry.PartitionSize)
 	}
 
-	// 打印BootSignature
+	// Print BootSignature
 	fmt.Printf("\nBootSignature: 0x%04X", mbr.BootSignature)
 	if mbr.BootSignature == 0x55AA {
-		fmt.Print(" (有效MBR)\n")
+		fmt.Print(" (Valid MBR)\n")
 	} else {
-		fmt.Print(" (无效MBR! 必须为0x55AA)\n")
+		fmt.Print(" (Invalid MBR! Must be 0x55AA)\n")
 	}
 }

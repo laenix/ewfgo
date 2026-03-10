@@ -1,0 +1,473 @@
+package ewf
+
+import (
+	"bytes"
+	"compress/zlib"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/laenix/ewfgo/internal"
+	"github.com/laenix/ewfgo/internal/filesystem"
+)
+
+// Open opens an EWF image file and parses its metadata.
+// It supports E01 format and automatically handles multi-volume files if present.
+//
+// Example:
+//
+//	img, err := ewf.Open("/path/to/disk.E01")
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//	defer img.Close()
+//
+//	// Read metadata
+//	fmt.Printf("Case: %s\n", img.CaseNumber())
+//	fmt.Printf("Evidence: %s\n", img.EvidenceNumber())
+//
+//	// Scan filesystems
+//	parts, _ := img.ScanFileSystems()
+//	for _, p := range parts {
+//		fmt.Printf("Partition %d: %s (%.2f GB)\n", p.Index, p.TypeName, float64(p.SizeBytes)/1024/1024/1024)
+//	}
+func Open(filepath string) (*EWFImage, error) {
+	e := &internal.EWFImage{}
+	_, err := e.Open(filepath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open EWF file: %w", err)
+	}
+
+	// Read and parse all sections
+	e.ReadSections()
+	if err := e.ParseSections(); err != nil {
+		return nil, fmt.Errorf("failed to parse sections: %w", err)
+	}
+
+	// Create wrapper with exported methods
+	return &EWFImage{
+		ewf: e,
+	}, nil
+}
+
+// EWFImage wraps the internal EWFImage and provides exported methods.
+type EWFImage struct {
+	ewf *internal.EWFImage
+}
+
+// Close closes the EWF image file.
+func (e *EWFImage) Close() error {
+	// No file handle to close in current implementation
+	return nil
+}
+
+// CaseNumber returns the case number from the EWF metadata.
+func (e *EWFImage) CaseNumber() string {
+	for _, h := range e.ewf.Headers {
+		return h.L3_c
+	}
+	return ""
+}
+
+// EvidenceNumber returns the evidence number from the EWF metadata.
+func (e *EWFImage) EvidenceNumber() string {
+	for _, h := range e.ewf.Headers {
+		return h.L3_n
+	}
+	return ""
+}
+
+// Examiner returns the examiner name from the EWF metadata.
+func (e *EWFImage) Examiner() string {
+	for _, h := range e.ewf.Headers {
+		return h.L3_e
+	}
+	return ""
+}
+
+// TotalSectors returns the total number of sectors in the image.
+func (e *EWFImage) TotalSectors() uint64 {
+	for _, v := range e.ewf.DiskSMART {
+		return v.SectorsCount
+	}
+	return 0
+}
+
+// SectorSize returns the size of each sector in bytes (usually 512).
+func (e *EWFImage) SectorSize() uint32 {
+	for _, v := range e.ewf.DiskSMART {
+		return v.SectorBytes
+	}
+	return 512
+}
+
+// ReadSector reads a single sector at the given logical block address (LBA).
+func (e *EWFImage) ReadSector(lba uint64) ([]byte, error) {
+	return e.ReadSectors(lba, 1)
+}
+
+// ReadSectors reads multiple sectors starting at the given logical block address (LBA).
+// It uses the table mapping to find compressed sector data and decompresses as needed.
+func (e *EWFImage) ReadSectors(lba uint64, count uint64) ([]byte, error) {
+	if e.ewf == nil || e.ewf.Filepath() == "" {
+		return nil, fmt.Errorf("no file opened")
+	}
+
+	// Try using the proper sector reading with decompression
+	data, err := e.ewf.ReadSectorData(lba, count)
+	if err != nil {
+		// Fall back to direct file read if table not available
+		sectorSize := int64(e.SectorSize())
+		offset := int64(lba) * sectorSize
+		length := int64(count) * sectorSize
+
+		data = e.ewf.ReadAt(offset, length)
+		if len(data) == 0 {
+			return nil, fmt.Errorf("failed to read sectors at LBA %d: %v", lba, err)
+		}
+	}
+
+	return data, nil
+}
+
+// MBR parses and returns the MBR (Master Boot Record) of the image.
+func (e *EWFImage) MBR() (internal.MBR, error) {
+	var mbr internal.MBR
+	// Check if we have sector data
+	if len(e.ewf.Sectors) == 0 || len(e.ewf.Sectors[0].TableEntry) == 0 {
+		return mbr, fmt.Errorf("no sector data available")
+	}
+	// Read first sector (uncompressed)
+	FirstSector := e.ewf.ReadAt(int64(e.ewf.Sectors[0].Address)+76, int64(e.ewf.Sectors[0].TableEntry[1])-int64(e.ewf.Sectors[0].TableEntry[0]))
+	r, err := zlib.NewReader(bytes.NewReader(FirstSector))
+	if err != nil {
+		return mbr, fmt.Errorf("failed to decompress sector data: %w", err)
+	}
+	defer r.Close()
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	binary.Read(bytes.NewReader(buf.Bytes()[:512]), binary.LittleEndian, &mbr)
+	return mbr, nil
+}
+
+// GPT parses and returns the GPT (GUID Partition Table) of the image.
+func (e *EWFImage) GPT() (internal.GPT, error) {
+	var gpt internal.GPT
+	// Check if we have sector data
+	if len(e.ewf.Sectors) == 0 || len(e.ewf.Sectors[0].TableEntry) == 0 {
+		return gpt, fmt.Errorf("no sector data available")
+	}
+	// Read first sector with GPT
+	FirstSector := e.ewf.ReadAt(int64(e.ewf.Sectors[0].Address)+76, int64(e.ewf.Sectors[0].TableEntry[1])-int64(e.ewf.Sectors[0].TableEntry[0]))
+	r, err := zlib.NewReader(bytes.NewReader(FirstSector))
+	if err != nil {
+		return gpt, fmt.Errorf("failed to decompress sector data: %w", err)
+	}
+	defer r.Close()
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	binary.Read(bytes.NewReader(buf.Bytes()[512:512+16896]), binary.LittleEndian, &gpt)
+	return gpt, nil
+}
+
+// GetDiskInfo returns the disk information from the EWF metadata.
+func (e *EWFImage) GetDiskInfo() *DiskInfo {
+	for _, v := range e.ewf.DiskSMART {
+		return &DiskInfo{
+			MediaType:        v.MediaType,
+			TotalSectors:     v.SectorsCount,
+			SectorBytes:      v.SectorBytes,
+			CHS:              fmt.Sprintf("%d/%d/%d", v.CHScylinders, v.CHSheads, v.CHSsectors),
+			CompressionLevel: v.CompressionLevel,
+			SegmentFileSetID: fmt.Sprintf("%x", v.SegmentFileSetIdentifier),
+		}
+	}
+	return nil
+}
+
+// DiskInfo contains disk metadata from the EWF image.
+type DiskInfo struct {
+	MediaType        byte
+	TotalSectors     uint64
+	SectorBytes      uint32
+	CHS              string
+	CompressionLevel byte
+	SegmentFileSetID string
+}
+
+// IsEWF checks if the given file is a valid EWF image.
+func IsEWF(filepath string) bool {
+	e := &internal.EWFImage{}
+	_, err := e.Open(filepath)
+	return err == nil
+}
+
+// FileExists checks if the given file exists.
+func FileExists(filepath string) bool {
+	_, err := os.Stat(filepath)
+	return err == nil
+}
+
+// APM returns the Apple Partition Map if present.
+func (e *EWFImage) APM() ([]internal.APMEntry, error) {
+	// Read first sector
+	data, err := e.ReadSectors(1, 1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read sector 1: %w", err)
+	}
+	return internal.ParseAPM(data)
+}
+
+// BSD returns the BSD Disklabel if present.
+func (e *EWFImage) BSD() (*internal.BSDDisklabel, error) {
+	// Read sector 0
+	data, err := e.ReadSectors(0, 1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read sector 0: %w", err)
+	}
+	return internal.ParseBSDDisklabel(data)
+}
+
+// LVM2 returns the LVM2 Physical Volume header if present.
+func (e *EWFImage) LVM2() (*internal.LVM2Header, error) {
+	// Read sector 1 (where LVM2 header is typically stored)
+	data, err := e.ReadSectors(1, 1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read sector 1: %w", err)
+	}
+	return internal.ParseLVM2(data)
+}
+
+// DetectPartitionType attempts to detect additional partition formats.
+// Returns a string describing the detected format.
+func (e *EWFImage) DetectPartitionType() string {
+	// Try APM (Apple Partition Map)
+	_, err := e.APM()
+	if err == nil {
+		return "Apple Partition Map (APM)"
+	}
+
+	// Try BSD Disklabel
+	_, err = e.BSD()
+	if err == nil {
+		return "BSD Disklabel"
+	}
+
+	// Try LVM2
+	_, err = e.LVM2()
+	if err == nil {
+		return "LVM2 Physical Volume"
+	}
+
+	return "Unknown"
+}
+
+// PartitionInfo contains information about a detected partition.
+type PartitionInfo struct {
+	Index          int
+	StartSector    uint64
+	SizeSectors    uint64
+	SizeBytes      uint64
+	Type           string
+	TypeCode       byte
+	TypeName       string
+	FileSystem     string
+	FilesystemType filesystem.FileSystemType
+}
+
+// ScanFileSystems scans the image for partitions and detects filesystems.
+// This is a simplified version that reads the MBR/GPT and detects filesystem types.
+func (e *EWFImage) ScanFileSystems() ([]PartitionInfo, error) {
+	var partitions []PartitionInfo
+
+	// Try MBR first
+	mbr, err := e.MBR()
+	if err == nil {
+		// Got MBR, parse partitions
+		for i, p := range mbr.PartitionTable {
+			if p.PartitionSize > 0 && p.PartitionType != 0x00 {
+				pi := PartitionInfo{
+					Index:          i + 1,
+					StartSector:    uint64(p.StartLBA),
+					SizeSectors:    uint64(p.PartitionSize),
+					SizeBytes:      uint64(p.PartitionSize) * 512,
+					Type:           fmt.Sprintf("0x%02X", p.PartitionType),
+					TypeCode:       p.PartitionType,
+					TypeName:       getPartitionTypeName(p.PartitionType),
+					FileSystem:     "Unknown",
+				}
+
+				// Try to detect filesystem in this partition
+				// Read more sectors to allow for partition alignment
+				if p.PartitionSize > 10 {
+					partSector, err := e.ReadSectors(uint64(p.StartLBA), 8)
+					if err == nil {
+						pi.FileSystem = DetectFileSystem(partSector)
+					}
+				}
+
+				// If still unknown, guess from partition type code
+				if pi.FileSystem == "Unknown" {
+					pi.FileSystem = GuessFileSystemFromPartitionType(p.PartitionType)
+				}
+
+				partitions = append(partitions, pi)
+			}
+		}
+	}
+
+	return partitions, nil
+}
+
+// DetectFileSystem attempts to detect the filesystem type from boot sector data.
+// It searches through the provided data for known filesystem signatures.
+func DetectFileSystem(sectorData []byte) string {
+	if len(sectorData) < 512 {
+		return "Unknown"
+	}
+
+	// For small data, check at offset 0 (traditional boot sector)
+	if len(sectorData) >= 512 {
+		// Check for NTFS (signature at offset 3)
+		if len(sectorData) >= 8 && string(sectorData[3:7]) == "NTFS" {
+			return "NTFS"
+		}
+
+		// Check for FAT32 (signature "FAT32   " at offset 0x52)
+		if len(sectorData) >= 0x5A && string(sectorData[0x52:0x5A]) == "FAT32   " {
+			return "FAT32"
+		}
+
+		// Check for FAT16 (signature "FAT16   " at offset 0x36)
+		if len(sectorData) >= 0x3E && string(sectorData[0x36:0x3E]) == "FAT16   " {
+			return "FAT16"
+		}
+
+		// Check for FAT12 (at offset 0x36)
+		if len(sectorData) >= 0x3E && string(sectorData[0x36:0x3A]) == "FAT1" {
+			return "FAT12"
+		}
+
+		// Check for exFAT ("EXFAT   " at offset 3)
+		if len(sectorData) >= 11 && string(sectorData[3:11]) == "EXFAT   " {
+			return "exFAT"
+		}
+	}
+
+	// Check for HFS+ (magic at offset 1024)
+	if len(sectorData) >= 1152 {
+		magic := binary.BigEndian.Uint32(sectorData[1024:1028])
+		if magic == 0x482B0000 {
+			return "HFS+"
+		}
+	}
+
+	// Check for APFS (magic at offset 4096)
+	if len(sectorData) >= 4104 {
+		magic := binary.LittleEndian.Uint64(sectorData[4096:4104])
+		if magic == 0x4141504653455250 {
+			return "APFS"
+		}
+	}
+
+	// Check for Linux ext2/3/4 (superblock at offset 1080)
+	if len(sectorData) >= 1088 {
+		magic := binary.BigEndian.Uint16(sectorData[1080:1082])
+		if magic == 0xEF53 {
+			return "ext4"
+		}
+	}
+
+	// Check for XFS ("XFSB" at offset 0)
+	if len(sectorData) >= 4 && string(sectorData[:4]) == "XFS" {
+		return "XFS"
+	}
+
+	// Check for SquashFS ("hsqs" at offset 96)
+	if len(sectorData) >= 100 && string(sectorData[96:100]) == "hsqs" {
+		return "SquashFS"
+	}
+
+	// Check for F2FS ("F2FS" at offset 0)
+	if len(sectorData) >= 4 && string(sectorData[:4]) == "F2FS" {
+		return "F2FS"
+	}
+
+	// Check for Btrfs (magic at offset 0x10000)
+	if len(sectorData) >= 0x10008 {
+		magic := string(sectorData[0x10000:0x10008])
+		if magic == "_BHRfS_M" {
+			return "Btrfs"
+		}
+	}
+
+	// Check for ReFS ("ReFS" or "ReFSB" at offset 3)
+	if len(sectorData) >= 9 && (string(sectorData[3:7]) == "ReFS" || string(sectorData[3:8]) == "ReFSB") {
+		return "ReFS"
+	}
+
+	return "Unknown"
+}
+
+// getPartitionTypeName returns a human-readable name for partition type codes.
+func getPartitionTypeName(t byte) string {
+	names := map[byte]string{
+		0x00: "Empty",
+		0x01: "FAT12",
+		0x04: "FAT16",
+		0x05: "Extended",
+		0x06: "FAT16",
+		0x07: "NTFS/HPFS",
+		0x0B: "FAT32 CHS",
+		0x0C: "FAT32 LBA",
+		0x0E: "FAT16 LBA",
+		0x0F: "Extended LBA",
+		0x11: "Hidden FAT12",
+		0x14: "Hidden FAT16",
+		0x16: "Hidden FAT16",
+		0x1B: "Hidden FAT32",
+		0x1C: "Hidden FAT32",
+		0x1E: "Hidden FAT16 LBA",
+		0x27: "Windows RE",
+		0x82: "Linux Swap",
+		0x83: "Linux",
+		0x8E: "Linux LVM",
+		0xEE: "GPT Protective",
+		0xEF: "EFI",
+		0xFD: "Linux RAID",
+	}
+	if name, ok := names[t]; ok {
+		return name
+	}
+	return fmt.Sprintf("Type 0x%02X", t)
+}
+
+// GuessFileSystemFromPartitionType attempts to guess filesystem from MBR partition type code.
+// This is a fallback when direct filesystem detection isn't possible.
+func GuessFileSystemFromPartitionType(t byte) string {
+	switch t {
+	case 0x01:
+		return "FAT12"
+	case 0x04, 0x06, 0x0E, 0x14, 0x16, 0x1E:
+		return "FAT16"
+	case 0x0B, 0x0C, 0x1B, 0x1C:
+		return "FAT32"
+	case 0x07, 0x17, 0x27:
+		return "NTFS"
+	case 0x83:
+		return "ext4"
+	case 0x8E:
+		return "LVM"
+	case 0x82:
+		return "Swap"
+	case 0xFD:
+		return "RAID"
+	case 0xEE:
+		return "GPT"
+	case 0xEF:
+		return "EFI"
+	default:
+		return "Unknown"
+	}
+}

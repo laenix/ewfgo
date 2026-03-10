@@ -1,207 +1,181 @@
-# EWFGO - 纯Go实现的EWF取证镜像解析库(开发中)
+# ewfgo - Pure Go EWF Forensic Image Parser
 
-EWFGO是一个纯Go实现的Expert Witness Format (EWF) 取证镜像解析库，可以用于读取和分析EWF格式的磁盘镜像文件（例如EnCase的.E01文件）。
+A pure Go implementation for parsing Expert Witness Format (EWF) forensic disk images (EnCase .E01 files).
 
-## 功能特性
+## Features
 
-- 完全用Go语言实现，无外部依赖
-- 支持验证EWF文件格式
-- 解析EWF文件的各个部分（header, disk, table等）
-- 读取扇区数据（单个扇区或多个连续扇区）
-- 支持压缩和非压缩数据块
-- 提供对原始字节数据的访问
-- 支持MD5/SHA1摘要验证
-- **文件系统解析**（支持FAT32，未来将支持更多文件系统）
+- ✅ Pure Go implementation, no external C dependencies
+- ✅ Validate EWF file format (E01)
+- ✅ Parse EWF sections (header, disk, table, volume)
+- ✅ Parse MBR partition table
+- ✅ Parse GPT partition table  
+- ✅ Read sector data (single or multiple sectors)
+- ✅ Decompress zlib/deflate compressed data
+- ✅ MD5/SHA1 hash verification
+- ✅ Filesystem detection (NTFS, FAT, ext4, XFS, Btrfs, HFS+, APFS, etc.)
+- ✅ Multi-partition support
+- 🚧 Multi-volume file support (E01, E02...)
 
-## 安装
+## Installation
 
 ```bash
 go get github.com/laenix/ewfgo
 ```
 
-## 快速开始
+## Quick Start
 
-### 基本用法
-
-```go
-package main
-
-import (
-    "fmt"
-    ewf "github.com/laenix/ewfgo"
-)
-
-func main() {
-    // 验证文件是否为EWF格式
-    if !ewf.IsEWFFile("evidence.E01") {
-        fmt.Println("不是有效的EWF文件")
-        return
-    }
-    
-    // 创建并解析EWF镜像
-    image := ewf.NewWithFilePath("evidence.E01")
-    err := image.Parse()
-    if err != nil {
-        fmt.Printf("解析失败: %v\n", err)
-        return
-    }
-    
-    // 显示基本信息
-    fmt.Printf("扇区大小: %d字节\n", image.GetSectorSize())
-    fmt.Printf("扇区总数: %d\n", image.GetSectorCount())
-    
-    // 读取第一个扇区
-    sector0, err := image.ReadSector(0)
-    if err != nil {
-        fmt.Printf("读取失败: %v\n", err)
-        return
-    }
-    
-    fmt.Printf("第一个扇区的前16个字节: % x\n", sector0[:16])
-}
-```
-
-### 文件系统解析
-
-```go
-package main
-
-import (
-    "fmt"
-    ewf "github.com/laenix/ewfgo"
-)
-
-func main() {
-    // 创建并解析EWF镜像
-    image := ewf.NewWithFilePath("evidence.E01")
-    err := image.Parse()
-    if err != nil {
-        fmt.Printf("解析失败: %v\n", err)
-        return
-    }
-    
-    // 获取文件系统
-    fs, err := image.GetFileSystem()
-    if err != nil {
-        fmt.Printf("获取文件系统失败: %v\n", err)
-        return
-    }
-    
-    if fs == nil {
-        fmt.Println("未检测到已知的文件系统")
-        return
-    }
-    
-    fmt.Printf("文件系统类型: %s\n", fs.GetType())
-    
-    // 获取根目录
-    root, err := fs.GetRootDirectory()
-    if err != nil {
-        fmt.Printf("获取根目录失败: %v\n", err)
-        return
-    }
-    
-    // 列出根目录文件
-    files, err := root.GetFiles()
-    if err != nil {
-        fmt.Printf("读取文件列表失败: %v\n", err)
-        return
-    }
-    
-    fmt.Printf("根目录包含 %d 个文件:\n", len(files))
-    for _, file := range files {
-        fmt.Printf("文件: %s, 大小: %d字节\n", file.GetName(), file.GetSize())
-    }
-    
-    // 获取特定文件
-    file, err := fs.GetFileByPath("/Windows/System32/notepad.exe")
-    if err != nil {
-        fmt.Printf("获取文件失败: %v\n", err)
-        return
-    }
-    
-    // 读取文件内容
-    content, err := file.ReadAll()
-    if err != nil {
-        fmt.Printf("读取文件内容失败: %v\n", err)
-        return
-    }
-    
-    fmt.Printf("读取文件 %s 成功，大小: %d字节\n", file.GetPath(), len(content))
-}
-```
-
-### 使用示例程序
-
-库中包含一个功能完整的示例程序 `examples/reade01.go`，可以展示如何使用该库：
+### CLI Usage
 
 ```bash
-# 显示EWF文件的基本信息
-go run examples/reade01.go -file=证据.E01 -action=info
+# Build
+go build -o ewftool ./cmd/main.go
 
-# 提取指定扇区并保存到文件
-go run examples/reade01.go -file=证据.E01 -action=extract -start=0 -count=1 -output=mbr.bin
+# Show disk info
+./ewftool evidence.E01 info
 
-# 列出EWF文件中的所有部分
-go run examples/reade01.go -file=证据.E01 -action=list
+# Show filesystem detection
+./ewftool evidence.E01 fs
 
-# 列出根目录内容
-go run examples/reade01.go -file=证据.E01 -action=fs -path=/
-
-# 提取文件
-go run examples/reade01.go -file=证据.E01 -action=fs -path=/Windows/notepad.exe -output=notepad.exe
+# Test file reading
+./ewftool evidence.E01 ls
 ```
 
-## API参考
+### Programmatic Usage
 
-### 主要类型
+```go
+package main
 
-- `EWFImage` - 表示EWF镜像文件
-- `Section` - 表示EWF文件中的部分
-- `TableSection`/`Table2Section` - 表示块表
-- `TableEntry` - 表示块表中的表项
-- `DiskSMART` - 包含磁盘信息
+import (
+	"fmt"
+	"log"
 
-### 主要函数和方法
+	"github.com/laenix/ewfgo"
+)
 
-#### 验证和创建
+func main() {
+	// Open EWF image
+	img, err := ewf.Open("evidence.E01")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer img.Close()
 
-- `IsEWFFile(filename string) bool` - 检查文件是否为EWF格式
-- `NewWithFilePath(filepath string) *EWFImage` - 创建新的EWFImage对象
+	// Print metadata
+	fmt.Printf("Case: %s\n", img.CaseNumber())
+	fmt.Printf("Evidence: %s\n", img.EvidenceNumber())
+	fmt.Printf("Examiner: %s\n", img.Examiner())
 
-#### 解析和访问
+	// Print disk info
+	disk := img.GetDiskInfo()
+	fmt.Printf("Total Sectors: %d\n", disk.TotalSectors)
+	fmt.Printf("Sector Size: %d bytes\n", disk.SectorBytes)
 
-- `(e *EWFImage) Parse() error` - 解析EWF文件
-- `(e *EWFImage) GetSectorSize() uint32` - 获取扇区大小
-- `(e *EWFImage) GetSectorCount() uint64` - 获取扇区总数
-- `(e *EWFImage) GetChunkSize() uint32` - 获取数据块大小
+	// Read MBR
+	mbr, err := img.MBR()
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Disk Signature: %d\n", mbr.DiskSignature)
 
-#### 数据读取
+	// Scan filesystems
+	parts, _ := img.ScanFileSystems()
+	for _, p := range parts {
+		fmt.Printf("Partition %d: %s (%s)\n", p.Index, p.TypeName, p.FileSystem)
+	}
 
-- `(e *EWFImage) ReadSector(sectorNumber uint64) ([]byte, error)` - 读取单个扇区
-- `(e *EWFImage) ReadSectors(startSector, count uint64) ([]byte, error)` - 读取多个连续扇区
-- `(e *EWFImage) ReadBytes(offset, size uint64) ([]byte, error)` - 根据字节偏移量和大小读取数据
+	// Read partition data
+	if len(parts) > 0 {
+		data, err := img.ReadSectors(parts[0].StartSector, 16)
+		if err == nil {
+			fmt.Printf("Read %d bytes from partition\n", len(data))
+		}
+	}
+}
+```
 
-#### 文件系统
+## Supported Filesystems
 
-- `(e *EWFImage) GetFileSystem() (filesystem.FileSystem, error)` - 获取文件系统解析器
+| Filesystem | Detection | Notes |
+|------------|-----------|-------|
+| NTFS | ✅ | Windows |
+| FAT12/16/32 | ✅ | Windows/MS-DOS |
+| exFAT | ✅ | Windows/SD cards |
+| ext2/3/4 | ✅ | Linux |
+| XFS | ✅ | Linux |
+| Btrfs | ✅ | Linux |
+| F2FS | ✅ | Linux/Mobile |
+| SquashFS | ✅ | Live CD |
+| HFS+ | ✅ | macOS (legacy) |
+| APFS | ✅ | macOS (modern) |
+| ReFS | ✅ | Windows Server |
+| BitLocker | ✅ | Detection only |
+| LUKS | ✅ | Detection only |
+| ZFS | ✅ | Detection only |
+| RAID | ✅ | Linux MD detection |
 
-## 支持的文件系统
+## API Reference
 
-当前库支持以下文件系统的解析：
+### Core Functions
 
-- FAT32 - 全面支持
-- NTFS - 计划实现
-- EXT2/3/4 - 计划实现
+| Function | Description |
+|----------|-------------|
+| `ewf.Open(filepath)` | Open and parse EWF image |
+| `ewf.IsEWF(filepath)` | Check if valid EWF file |
 
-## 支持的EWF版本
+### EWFImage Methods
 
-当前支持EnCase 1-7格式的EWF文件（EWF-E01）。
+| Method | Description |
+|--------|-------------|
+| `Close()` | Close file |
+| `CaseNumber()` | Get case number |
+| `EvidenceNumber()` | Get evidence number |
+| `Examiner()` | Get examiner name |
+| `TotalSectors()` | Get total sector count |
+| `SectorSize()` | Get sector size in bytes |
+| `GetDiskInfo()` | Get disk metadata |
+| `ReadSector(lba)` | Read single sector |
+| `ReadSectors(lba, count)` | Read multiple sectors |
+| `MBR()` | Parse MBR |
+| `GPT()` | Parse GPT |
+| `ScanFileSystems()` | Scan partitions and detect filesystems |
+| `ListFiles(partitionIndex)` | List root directory |
 
-## 贡献
+## Project Structure
 
-欢迎提交Pull Request或Issue！
+```
+ewfgo/
+├── ewfgo.go          # Main entry point
+├── open.go           # Public API
+├── open_files.go     # File reading functions
+├── cmd/main.go       # CLI tool
+├── open.go          # Exported API
+├── open_files.go     # File reading functions
+├── internal/
+│   ├── constants.go  # Constants
+│   ├── ewf.go        # Core EWF parsing
+│   ├── mbr.go        # MBR parsing
+│   ├── gpt.go        # GPT parsing
+│   ├── partitions.go # APM/BSD/LVM detection
+│   └── filesystem/   # Filesystem implementations
+│       ├── fs.go     # Interface & detection
+│       ├── ntfs.go   # NTFS parser
+│       ├── fat.go    # FAT parser
+│       ├── ext4.go   # ext2/3/4 parser
+│       └── ...       # More filesystems
+└── cmd/
+    └── main.go       # CLI entry
+```
 
-## 许可证
+## Supported EWF Versions
+
+- EnCase 1-7 format (EWF-E01)
+- Single file E01
+- Multi-volume files (E01, E02...)
+
+## Reference
+
+- [EWF Format Specification](./Expert%20Witness%20Compression%20Format%20(EWF).asciidoc)
+
+## License
 
 MIT
