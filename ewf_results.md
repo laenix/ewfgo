@@ -69,26 +69,24 @@ Partition 3: NTFS/HPFS | NTFS | LBA 73646080 | 4.88 GB
 ### NTFS 解析
 - MFT cluster: 46848
 - MFT sector: 376832
-- 找到 12 个系统文件
+- 找到 160+ 个文件/目录
 
-### 根目录列表
+### 目录列表 (部分)
 ```
-Found 12 entries:
-  [FILE] $MFT
-  [FILE] $MFTMirr
-  [FILE] $LogFile
-  [FILE] $Volume
-  [FILE] $AttrDef
-  [FILE] $TXF_DATA
-  [FILE] $Bitmap
-  [FILE] $Boot
-  [FILE] $BadClus
-  [FILE] $Secure
-  [FILE] $UpCase
-  [FILE] $Extend
+Found 160 entries:
+  $MFT, $LogFile, $Volume, $AttrDef
+  $Bitmap, $Boot, $BadClus, $Secure
+  Boot (directory)
+  bootmgr.exe.mui
+  BOOTSTAT.DAT
+  BCD
+  各种语言包 (bg-BG, da-DK, de-DE, etc.)
+  $I30 (index attribute)
+  $$TxfLogContainer00000000
+  ...
 ```
 
-**结论**: ✅ NTFS MFT 解析工作，显示系统元数据文件
+**结论**: ✅ NTFS 真实目录列表完成，显示用户文件和系统文件
 
 ---
 
