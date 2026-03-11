@@ -416,6 +416,14 @@ func (e *EWFImage) ScanFileSystems() ([]PartitionInfo, error) {
 							   partTypeGUID[15] == 0xEF {
 								fsType = "EFI"
 							}
+							// Check for APFS (Apple_APFS: 7C3457EF-0000-11AA-AA11-00306543ECAC)
+							// GUID bytes: EF 57 34 7C 00 00 AA 11 AA 11 00 30 65 43 EC AC
+							if len(partTypeGUID) >= 16 &&
+							   partTypeGUID[0] == 0xEF && partTypeGUID[1] == 0x57 &&
+							   partTypeGUID[2] == 0x34 && partTypeGUID[3] == 0x7C &&
+							   partTypeGUID[6] == 0xAA && partTypeGUID[7] == 0x11 {
+								fsType = "APFS"
+							}
 						}
 						
 						pi := PartitionInfo{
