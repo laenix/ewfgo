@@ -140,11 +140,18 @@ func (e *EWFImage) MBR() (internal.MBR, error) {
 	if len(e.ewf.Sectors) == 0 || len(e.ewf.Sectors[0].TableEntry) == 0 {
 		return mbr, fmt.Errorf("no sector data available")
 	}
-	// Read first sector (uncompressed)
-	FirstSector := e.ewf.ReadAt(int64(e.ewf.Sectors[0].Address)+76, int64(e.ewf.Sectors[0].TableEntry[1])-int64(e.ewf.Sectors[0].TableEntry[0]))
+	// Read first sector - use correct formula: Address + tableEntry[0]
+	sectorsStart := int64(e.ewf.Sectors[0].Address)
+	firstEntryOffset := int64(e.ewf.Sectors[0].TableEntry[0] & 0x7FFFFFFF)
+	chunkStart := sectorsStart + firstEntryOffset
+	chunkSize := int64(e.ewf.Sectors[0].TableEntry[1]) - chunkStart
+	
+	FirstSector := e.ewf.ReadAt(chunkStart, chunkSize)
 	r, err := zlib.NewReader(bytes.NewReader(FirstSector))
 	if err != nil {
-		return mbr, fmt.Errorf("failed to decompress sector data: %w", err)
+		// If decompression fails, data might not be compressed - use raw data
+		binary.Read(bytes.NewReader(FirstSector[:512]), binary.LittleEndian, &mbr)
+		return mbr, nil
 	}
 	defer r.Close()
 	var buf bytes.Buffer
@@ -160,11 +167,18 @@ func (e *EWFImage) GPT() (internal.GPT, error) {
 	if len(e.ewf.Sectors) == 0 || len(e.ewf.Sectors[0].TableEntry) == 0 {
 		return gpt, fmt.Errorf("no sector data available")
 	}
-	// Read first sector with GPT
-	FirstSector := e.ewf.ReadAt(int64(e.ewf.Sectors[0].Address)+76, int64(e.ewf.Sectors[0].TableEntry[1])-int64(e.ewf.Sectors[0].TableEntry[0]))
+	// Read first sector with GPT - use correct formula
+	sectorsStart := int64(e.ewf.Sectors[0].Address)
+	firstEntryOffset := int64(e.ewf.Sectors[0].TableEntry[0] & 0x7FFFFFFF)
+	chunkStart := sectorsStart + firstEntryOffset
+	chunkSize := int64(e.ewf.Sectors[0].TableEntry[1]) - chunkStart
+	
+	FirstSector := e.ewf.ReadAt(chunkStart, chunkSize)
 	r, err := zlib.NewReader(bytes.NewReader(FirstSector))
 	if err != nil {
-		return gpt, fmt.Errorf("failed to decompress sector data: %w", err)
+		// If decompression fails, data might not be compressed - use raw data
+		binary.Read(bytes.NewReader(FirstSector[512:512+16896]), binary.LittleEndian, &gpt)
+		return gpt, nil
 	}
 	defer r.Close()
 	var buf bytes.Buffer

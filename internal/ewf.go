@@ -113,7 +113,8 @@ func (e *EWFImage) ReadSectorAt(sectorNum int) ([]byte, error) {
 	chunkOffset := int64(tableEntry[chunkIndex] & 0x7FFFFFFF)
 	isCompressed := (tableEntry[chunkIndex] & 0x80000000) != 0
 
-	sectorsStart := int64(e.Sectors[0].Address) + 76
+	// The table entry is offset from sectors section start
+	sectorsStart := int64(e.Sectors[0].Address)
 	chunkStart := sectorsStart + chunkOffset
 	chunkSize := chunkSectors * sectorSize
 
@@ -230,7 +231,12 @@ func (e *EWFImage) IsPartitionImage() bool {
 func (e *EWFImage) GetPartitionType() string {
 	// Use decompress method (same as PrintMBR) - proven to work for all files
 	if len(e.Sectors) > 0 && len(e.Sectors[0].TableEntry) > 0 {
-		FirstSector := e.ReadAt(int64(e.Sectors[0].Address)+76, 
+		// The table entry is offset from sectors section start
+		sectorsStart := int64(e.Sectors[0].Address)
+		firstEntryOffset := int64(e.Sectors[0].TableEntry[0] & 0x7FFFFFFF)
+		chunkStart := sectorsStart + firstEntryOffset
+		
+		FirstSector := e.ReadAt(chunkStart, 
 			int64(e.Sectors[0].TableEntry[1])-int64(e.Sectors[0].TableEntry[0]))
 		if len(FirstSector) > 0 {
 			r, err := zlib.NewReader(bytes.NewReader(FirstSector))
@@ -397,9 +403,11 @@ func (e *EWFImage) ReadSectorData(startSector uint64, numSectors uint64) ([]byte
 	// Use the correct sector section
 	sectionStartSector := sectorSectionOffsets[sectionIndex]
 	tableEntry := e.Sectors[sectionIndex].TableEntry
-	// Note: The table entry offsets are absolute file offsets within sectors section data
-	// sector section data starts at: Address + SectionLength
-	// But the table entries already include this offset, so we use them directly
+	
+	// Get the sectors section start address from the section
+	// This is the file offset where the sectors section header starts
+	sectorsSectionStart := e.Sectors[sectionIndex].Address
+	
 	maxSectors := uint64(len(tableEntry)) * chunkSectors
 
 	fmt.Printf("[DEBUG ReadSectorData] Using section %d (starts at sector %d), Table entries: %d, max addressable: %d\n",
@@ -464,8 +472,8 @@ func (e *EWFImage) ReadSectorData(startSector uint64, numSectors uint64) ([]byte
 		isCompressed := !bit31Set
 
 		// Read the chunk from sectors section
-		// The table entry offset is the absolute file offset of the chunk data
-		chunkStart := chunkOffset
+		// The table entry is an offset FROM the sectors section start
+		chunkStart := sectorsSectionStart + chunkOffset
 		chunkSize := int(chunkBytes)
 		chunkData := e.ReadAt(chunkStart, int64(chunkSize))
 

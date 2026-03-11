@@ -45,6 +45,13 @@ func (e *EWFImage) ListDirectory(partitionIndex int, dirPath string) ([]filesyst
 		}
 		// NTFS - only root for now
 		return handler.ListDirectory(dirPath)
+	
+	case "ext4":
+		handler, err := filesystem.NewExt4Handler(e, p.StartSector)
+		if err != nil {
+			return nil, err
+		}
+		return handler.ListDirectory(dirPath)
 		
 	default:
 		return nil, ErrNotSupported

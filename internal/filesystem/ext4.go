@@ -36,42 +36,36 @@ func NewExt4Handler(reader Reader, startLBA uint64) (*Ext4Handler, error) {
 
 // readSuperblock reads and parses the ext4 superblock
 func (h *Ext4Handler) readSuperblock() error {
-	// Superblock is at offset 1024 (1KB) from start of filesystem
-	// Try 1KB offset first (1KB block size case)
-	sbData, err := h.reader.ReadSectors(h.startLBA, 8)
+	// Read more sectors to find superblock (might be at LBA 1-2, not LBA 0)
+	// Superblock is typically at offset 1024 (1KB) from filesystem start
+	sbData, err := h.reader.ReadSectors(h.startLBA, 16)
 	if err != nil {
 		return fmt.Errorf("failed to read superblock: %w", err)
 	}
 	
-	// Check for ext4 magic at offset 1024 + 0x38 (0x53EF)
-	superblockOffset := 1024 // offset within sector data
-	if len(sbData) >= superblockOffset+2 {
-		magic := binary.BigEndian.Uint16(sbData[superblockOffset+0x38:])
-		if magic == 0x53EF {
-			return h.parseSuperblock(sbData[superblockOffset:])
-		}
-	}
+	// Search for ext4 magic (0x53EF) at common offsets
+	// For 1KB block size: superblock at offset 1024 (sector 2)
+	// For 4KB block size: superblock at offset 4096 (sector 8)
+	searchOffsets := []int{1024, 4096, 2048, 6144}
 	
-	// Try at offset 4096 (4KB block size case)
-	if len(sbData) >= 4096+2 {
-		magic := binary.BigEndian.Uint16(sbData[4096+0x38:])
-		if magic == 0x53EF {
-			return h.parseSuperblock(sbData[4096:])
-		}
-	}
-	
-	// Try backup superblocks (at block 1 for 1KB blocks, or block 8193 for 4KB blocks)
-	backupOffsets := []uint64{8193, 32768, 131072}
-	for _, offset := range backupOffsets {
-		backupData, err := h.reader.ReadSectors(h.startLBA+offset, 8)
-		if err != nil {
-			continue
-		}
-		if len(backupData) >= 1024+2 {
-			magic := binary.BigEndian.Uint16(backupData[1024+0x38:])
+	for _, offset := range searchOffsets {
+		if len(sbData) >= offset+0x38+2 {
+			magic := binary.BigEndian.Uint16(sbData[offset+0x38:])
 			if magic == 0x53EF {
-				fmt.Printf("[ext4] Found backup superblock at offset %d\n", offset)
-				return h.parseSuperblock(backupData[1024:])
+				fmt.Printf("[ext4] Found superblock at offset %d (LBA %d)\n", offset, offset/512)
+				return h.parseSuperblock(sbData[offset:])
+			}
+		}
+	}
+	
+	// Also try scanning for magic anywhere in the data
+	for i := 0; i < len(sbData)-2; i++ {
+		if sbData[i] == 0x53 && sbData[i+1] == 0xEF {
+			// Found potential magic, check if it's at the right offset
+			offset := i - 0x38
+			if offset >= 0 && offset%1024 == 0 {
+				fmt.Printf("[ext4] Found ext4 magic at offset %d\n", offset)
+				return h.parseSuperblock(sbData[offset:])
 			}
 		}
 	}
@@ -134,6 +128,9 @@ func (h *Ext4Handler) readDirectory(inodeNum uint32) ([]DirectoryEntry, error) {
 	// Each group descriptor is 64 bytes (ext4)
 	groupDescOffset := gdtBlock*uint64(h.blockSize) + uint64(groupNum)*64
 	groupDescSector := uint64(groupDescOffset) / 512
+	
+	fmt.Printf("[ext4] Reading GDT at sector %d (offset %d)\n", groupDescSector, groupDescOffset)
+	
 	groupDescData, err := h.reader.ReadSectors(h.startLBA+groupDescSector, 8)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read group descriptor: %w", err)
