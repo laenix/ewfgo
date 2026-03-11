@@ -1,7 +1,10 @@
 package internal
 
+import "os"
+
 type EWFImage struct {
 	filepath       string // 文件路径
+	file           *os.File
 	Sections       []SectionWithAddress
 	Headers        []HeaderSectionString
 	Volumes        []EWFSpecification

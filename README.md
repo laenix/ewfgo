@@ -33,11 +33,23 @@ go build -o ewftool ./cmd/main.go
 # Show disk info
 ./ewftool evidence.E01 info
 
+# List MBR partitions
+./ewftool evidence.E01 parts
+
+# List GPT partitions in detail
+./ewftool evidence.E01 gpt
+
 # Show filesystem detection
 ./ewftool evidence.E01 fs
 
-# Test file reading
+# List root directory
 ./ewftool evidence.E01 ls
+
+# List specific path (ext4)
+./ewftool evidence.E01 ls /home
+
+# Read sectors (hex dump)
+./ewftool evidence.E01 read 0 16
 ```
 
 ### Programmatic Usage
@@ -137,8 +149,11 @@ func main() {
 | `ReadSectors(lba, count)` | Read multiple sectors |
 | `MBR()` | Parse MBR |
 | `GPT()` | Parse GPT |
+| `GetGPTPartitions()` | Get GPT partitions with filesystem detection |
 | `ScanFileSystems()` | Scan partitions and detect filesystems |
 | `ListFiles(partitionIndex)` | List root directory |
+| `ListExt4Directory(lba, path)` | List ext4 directory (supports subdirectories) |
+| `LookupExt4Path(lba, path)` | Look up path in ext4, return inode number |
 
 ## Project Structure
 

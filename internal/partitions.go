@@ -9,38 +9,38 @@ import (
 // PartitionType constants
 const (
 	// MBR partition types
-	MBRTypeEmpty       = 0x00
-	MBRTypeFAT12       = 0x01
-	MBRTypeFAT16       = 0x04
-	MBRTypeExtended    = 0x05
-	MBRTypeFAT16B      = 0x06
-	MBRTypeNTFS        = 0x07
-	MBRTypeFAT32       = 0x0B
-	MBRTypeFAT32X      = 0x0C
-	MBRTypeFAT16X      = 0x0E
-	MBRTypeExtendedX   = 0x0F
-	MBRTypeLinux       = 0x83
-	MBRTypeLinuxSwap   = 0x82
-	MBRTypeLinuxLVM    = 0x8E
-	MBRTypeGPT         = 0xEE
-	MBRTypeMS_Rsrv     = 0xDC
+	MBRTypeEmpty     = 0x00
+	MBRTypeFAT12     = 0x01
+	MBRTypeFAT16     = 0x04
+	MBRTypeExtended  = 0x05
+	MBRTypeFAT16B    = 0x06
+	MBRTypeNTFS      = 0x07
+	MBRTypeFAT32     = 0x0B
+	MBRTypeFAT32X    = 0x0C
+	MBRTypeFAT16X    = 0x0E
+	MBRTypeExtendedX = 0x0F
+	MBRTypeLinux     = 0x83
+	MBRTypeLinuxSwap = 0x82
+	MBRTypeLinuxLVM  = 0x8E
+	MBRTypeGPT       = 0xEE
+	MBRTypeMS_Rsrv   = 0xDC
 )
 
 // APM - Apple Partition Map
 // Located in block 1-63 of Apple partition scheme disks
 type APMEntry struct {
-	Signature       uint32  // "APM" magic (0x504D)
+	Signature       uint32 // "APM" magic (0x504D)
 	Reserved1       uint32
-	NumberOfEntries uint32  // Number of partition entries
-	EntrySize       uint32  // Size of each entry (usually 512)
-	EntryPosition   uint32  // Block number of this entry
+	NumberOfEntries uint32 // Number of partition entries
+	EntrySize       uint32 // Size of each entry (usually 512)
+	EntryPosition   uint32 // Block number of this entry
 	Reserved2       uint32
-	PartitionName   [32]byte  // Partition name (UTF-8)
-	PartitionType   [32]byte  // Partition type (e.g., "Apple_HFS", "Linux")
+	PartitionName   [32]byte // Partition name (UTF-8)
+	PartitionType   [32]byte // Partition type (e.g., "Apple_HFS", "Linux")
 	StartingSector  uint32
 	EndingSector    uint32
 	SizeInSectors   uint32
-	Attributes      uint32  // Partition attributes
+	Attributes      uint32 // Partition attributes
 	Reserved3       [32]byte
 }
 
@@ -52,7 +52,7 @@ type BSDDisklabel struct {
 	Reserved        [88]byte
 	Partitions      [8]BSDPartition
 	Version         uint32
-	Magic           uint32  // 0x82564557
+	Magic           uint32 // 0x82564557
 	MSC             uint16
 	LastModified    uint32
 	BootAreaSize    uint32
@@ -76,25 +76,25 @@ type BSDDisklabel struct {
 }
 
 type BSDPartition struct {
-	Offset      uint32  // Starting sector
-	Size        uint32  // Number of sectors
-	Fragment    uint8   // Fragment size (0 = 512, 1 = 1024, etc.)
-	Type        uint8   // BSD partition type
+	Offset      uint32 // Starting sector
+	Size        uint32 // Number of sectors
+	Fragment    uint8  // Fragment size (0 = 512, 1 = 1024, etc.)
+	Type        uint8  // BSD partition type
 	Deprecated1 uint8
 	Deprecated2 uint8
-	Flags       uint16  // Flags
+	Flags       uint16 // Flags
 }
 
 const BSDMagic = 0x82564557
 
 // APM Partition Types
 const (
-	APMTypeApple_HFS       = "Apple_HFS"
-	APMTypeApple_APM       = "Apple_partition_map"
-	APMTypeApple_UNIX      = "Apple_UNIX_SVR2"
-	APMTypeApple_Free     = "Apple_Free"
-	APMTypeLinux           = "Linux"
-	APMTypeLinux_LVM       = "Linux_LVM"
+	APMTypeApple_HFS  = "Apple_HFS"
+	APMTypeApple_APM  = "Apple_partition_map"
+	APMTypeApple_UNIX = "Apple_UNIX_SVR2"
+	APMTypeApple_Free = "Apple_Free"
+	APMTypeLinux      = "Linux"
+	APMTypeLinux_LVM  = "Linux_LVM"
 )
 
 // ParseAPM parses Apple Partition Map from the given data
@@ -118,7 +118,7 @@ func ParseAPM(data []byte) ([]APMEntry, error) {
 		}
 
 		entries = append(entries, entry)
-		
+
 		// Check for last entry
 		partType := string(bytes.Trim(entry.PartitionType[:], "\x00"))
 		if partType == "Apple_Free" {
@@ -159,19 +159,19 @@ func ParseBSDDisklabel(data []byte) (*BSDDisklabel, error) {
 // LVM2 Physical Volume Header
 // Located at sector 1 (512 bytes)
 type LVM2Header struct {
-	Label        [8]byte     // "_LVM2_PV"
-	Reserved1    [8]byte
-	PV_Size      uint64      // Size of PV
-	LVMActivatd  uint8       // LVM2 activated
-	Reserved2    [8]byte
-	VG_NameLen   uint32      // Length of VG name
-	VG_Name      [128]byte   // Volume Group name
-	PV_Number    uint32      // PV number in VG
-	Reserved3    [32]byte
-	DataStart    uint64      // Offset to data area
-	DataSize     uint64      // Size of data area
-	MetaStart    uint64      // Offset to metadata area
-	MetaSize     uint64      // Size of metadata area
+	Label       [8]byte // "_LVM2_PV"
+	Reserved1   [8]byte
+	PV_Size     uint64 // Size of PV
+	LVMActivatd uint8  // LVM2 activated
+	Reserved2   [8]byte
+	VG_NameLen  uint32    // Length of VG name
+	VG_Name     [128]byte // Volume Group name
+	PV_Number   uint32    // PV number in VG
+	Reserved3   [32]byte
+	DataStart   uint64 // Offset to data area
+	DataSize    uint64 // Size of data area
+	MetaStart   uint64 // Offset to metadata area
+	MetaSize    uint64 // Size of metadata area
 }
 
 const LVM2Signature = "_LVM2_PV"
@@ -203,7 +203,7 @@ func PrintAPM(entries []APMEntry) {
 	for i, e := range entries {
 		name := string(bytes.Trim(e.PartitionName[:], "\x00"))
 		ptype := string(bytes.Trim(e.PartitionType[:], "\x00"))
-		
+
 		fmt.Printf("Partition %d:\n", i+1)
 		fmt.Printf("  Name: %s\n", name)
 		fmt.Printf("  Type: %s\n", ptype)
@@ -224,22 +224,22 @@ func PrintBSDDisklabel(label *BSDDisklabel) {
 	fmt.Printf("Heads/Cylinder: %d\n", label.HeadsPerCyl)
 	fmt.Printf("Total Sectors: %d\n", label.NumSectors)
 	fmt.Println("Partitions:")
-	
+
 	bsdTypeNames := map[uint8]string{
-		0: "unused",
-		1: "swap",
-		2: "Version 6 Unix",
-		3: "Version 7 Unix",
-		4: "ext2fs",
-		5: "4.2BSD FFS",
-		6: "MSDOS",
-		7: "Linux native",
-		8: "NTFS",
-		9:"HPFS",
+		0:  "unused",
+		1:  "swap",
+		2:  "Version 6 Unix",
+		3:  "Version 7 Unix",
+		4:  "ext2fs",
+		5:  "4.2BSD FFS",
+		6:  "MSDOS",
+		7:  "Linux native",
+		8:  "NTFS",
+		9:  "HPFS",
 		10: "iso9660",
 		11: "boot",
 	}
-	
+
 	for i, p := range label.Partitions {
 		if p.Size > 0 {
 			fmt.Printf("  %c: type=%d (%s), size=%d sectors, offset=%d\n",

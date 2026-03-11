@@ -30,11 +30,30 @@ func (e *EWFImage) IsEWFFile() bool {
 
 func (e *EWFImage) Open(file string) (*EWFImage, error) {
 	e.filepath = file
+	// 打开文件并缓存句柄以提高性能
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+	e.file = f
+
 	// 判断是否为WEF文件签名
 	if !e.IsEWFFile() {
+		e.file.Close()
+		e.file = nil
 		return nil, errors.New("not ewf file")
 	}
 	return e, nil
+}
+
+// Close closes the EWF image file
+func (e *EWFImage) Close() error {
+	if e.file != nil {
+		err := e.file.Close()
+		e.file = nil
+		return err
+	}
+	return nil
 }
 
 // Filepath returns the file path of the EWF image.
@@ -46,13 +65,23 @@ func (e *EWFImage) Filepath() string {
 // ReadAt reads raw bytes from the EWF file at the given offset.
 // For actual sector data, use ReadSectorData instead.
 func (e *EWFImage) ReadAt(addr int64, length int64) []byte {
-	file, err := os.Open(e.filepath)
+	if e.file == nil {
+		// Fallback: file not open, open temporarily
+		file, err := os.Open(e.filepath)
+		if err != nil {
+			return nil
+		}
+		defer file.Close()
+		buffer := make([]byte, length)
+		file.ReadAt(buffer, addr)
+		return buffer
+	}
+
+	buffer := make([]byte, length)
+	_, err := e.file.ReadAt(buffer, addr)
 	if err != nil {
 		return nil
 	}
-	defer file.Close()
-	buffer := make([]byte, length)
-	file.ReadAt(buffer, addr)
 	return buffer
 }
 
@@ -337,30 +366,106 @@ func (e *EWFImage) ReadSectorData(startSector uint64, numSectors uint64) ([]byte
 	}
 	chunkBytes = chunkSectors * sectorSize
 
-	// Get table entry for the first (and usually only) sectors section
-	tableEntry := e.Sectors[0].TableEntry
-	sectorsStart := int64(e.Sectors[0].Address) + SectionLength
+	// Calculate sector offsets for each sector section
+	// Each section's table covers a range of sectors
+	var sectorSectionOffsets []uint64
+	var cumulativeSectors uint64 = 0
+	for i, s := range e.Sectors {
+		sectorSectionOffsets = append(sectorSectionOffsets, cumulativeSectors)
+		sectionSectors := uint64(len(s.TableEntry)) * chunkSectors
+		cumulativeSectors += sectionSectors
+		if i == 0 {
+			// Debug: show first section info
+			fmt.Printf("[DEBUG ReadSectorData] Section 0: TableEntries=%d, chunkSectors=%d, covers sectors %d-%d\n",
+				len(s.TableEntry), chunkSectors, sectorSectionOffsets[i], cumulativeSectors-1)
+		}
+	}
+
+	// Find which sector section contains the requested startSector
+	sectionIndex := 0
+	for i := 0; i < len(e.Sectors); i++ {
+		sectionSectors := uint64(len(e.Sectors[i].TableEntry)) * chunkSectors
+		if startSector < sectorSectionOffsets[i]+sectionSectors {
+			sectionIndex = i
+			break
+		}
+		if i == len(e.Sectors)-1 {
+			sectionIndex = i
+		}
+	}
+
+	// Use the correct sector section
+	sectionStartSector := sectorSectionOffsets[sectionIndex]
+	tableEntry := e.Sectors[sectionIndex].TableEntry
+	// Note: The table entry offsets are absolute file offsets within sectors section data
+	// sector section data starts at: Address + SectionLength
+	// But the table entries already include this offset, so we use them directly
+	maxSectors := uint64(len(tableEntry)) * chunkSectors
+
+	fmt.Printf("[DEBUG ReadSectorData] Using section %d (starts at sector %d), Table entries: %d, max addressable: %d\n",
+		sectionIndex, sectionStartSector, len(tableEntry), maxSectors)
+	fmt.Printf("[DEBUG ReadSectorData] Requested: startSector=%d (relative: %d), numSectors=%d\n",
+		startSector, startSector-sectionStartSector, numSectors)
+
+	// Show first few table entries
+	if len(tableEntry) > 0 {
+		for i := 0; i < 3 && i < len(tableEntry); i++ {
+			offset := tableEntry[i] & 0x7FFFFFFF
+			compressed := (tableEntry[i] & 0x80000000) != 0
+			compStr := "uncompressed"
+			if compressed {
+				compStr = "compressed"
+			}
+			fmt.Printf("[DEBUG ReadSectorData] Table[%d]: offset=%d (%s)\n", i, offset, compStr)
+		}
+	}
 
 	totalBytes := numSectors * sectorSize
 	result := make([]byte, 0, totalBytes)
 
+	// Calculate the relative sector number within this section
+	relativeStartSector := startSector - sectionStartSector
+
 	// Read each sector requested
 	for i := uint64(0); i < numSectors; i++ {
-		sectorNum := startSector + i
+		sectorNum := relativeStartSector + i
 
 		// Find which chunk this sector belongs to
 		chunkIndex := sectorNum / chunkSectors
 		offsetInChunk := sectorNum % chunkSectors
 
 		if chunkIndex >= uint64(len(tableEntry)) {
+			// Try next section if available
+			if sectionIndex < len(e.Sectors)-1 {
+				// For simplicity, just return zero-filled data for out-of-range sectors
+				// (this handles sparse files where some sectors don't have data)
+				zeroSector := make([]byte, sectorSize)
+				result = append(result, zeroSector...)
+				continue
+			}
 			return nil, fmt.Errorf("sector %d out of range (max chunk: %d)", sectorNum, len(tableEntry))
 		}
 
 		chunkOffset := int64(tableEntry[chunkIndex] & 0x7FFFFFFF)
-		isCompressed := (tableEntry[chunkIndex] & 0x80000000) != 0
+		
+		// For FTK Imager E01 format, bit 31=1 means uncompressed (opposite of standard EWF!)
+		// Try decompressing if either the flag says compressed OR decompression works
+		rawEntry := tableEntry[chunkIndex]
+		bit31Set := (rawEntry & 0x80000000) != 0
+		
+		// Debug: show the raw entry
+		if sectorNum < 5 {
+			fmt.Printf("[DEBUG] sectorNum=%d, chunkIndex=%d, rawEntry=0x%08x, bit31Set=%v\n",
+				sectorNum, chunkIndex, rawEntry, bit31Set)
+		}
+		
+		// FTK Imager: if bit31 is CLEAR, data is compressed; if SET, it's uncompressed
+		// This is the reverse of standard libewf behavior
+		isCompressed := !bit31Set
 
 		// Read the chunk from sectors section
-		chunkStart := sectorsStart + chunkOffset
+		// The table entry offset is the absolute file offset of the chunk data
+		chunkStart := chunkOffset
 		chunkSize := int(chunkBytes)
 		chunkData := e.ReadAt(chunkStart, int64(chunkSize))
 

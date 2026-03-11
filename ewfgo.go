@@ -61,25 +61,25 @@ func RunWithFile(filepath string) error {
 	fmt.Println("╔═══════════════════════════════════════════════════════════╗")
 	fmt.Println("║                     EWF Image Info                        ║")
 	fmt.Println("╠═══════════════════════════════════════════════════════════╣")
-	
+
 	if caseNum != "" {
 		fmt.Printf("║ Case:         %-42s ║\n", caseNum)
 	} else {
 		fmt.Printf("║ Case:         %-42s ║\n", "(none)")
 	}
-	
+
 	if evidenceNum != "" {
 		fmt.Printf("║ Evidence:     %-42s ║\n", evidenceNum)
 	} else {
 		fmt.Printf("║ Evidence:     %-42s ║\n", "(none)")
 	}
-	
+
 	fmt.Printf("║ Description:  %-42s ║\n", desc)
-	
+
 	if examiner != "" {
 		fmt.Printf("║ Examiner:     %-42s ║\n", examiner)
 	}
-	
+
 	if acquisitionTime != "" {
 		fmt.Printf("║ Acquired:     %-42s ║\n", acquisitionTime)
 	}
@@ -88,7 +88,7 @@ func RunWithFile(filepath string) error {
 	totalSectors := uint64(0)
 	sectorSize := uint32(512)
 	compression := 0
-	
+
 	for _, v := range ewfImg.DiskSMART {
 		totalSectors = v.SectorsCount
 		sectorSize = v.SectorBytes
@@ -99,7 +99,7 @@ func RunWithFile(filepath string) error {
 	fmt.Printf("║ Total Size:   %-42s ║\n", formatSize(totalSectors, sectorSize))
 	fmt.Printf("║ Sector Size:  %-42d bytes║\n", sectorSize)
 	fmt.Printf("║ Total Sectors: %-41d ║\n", totalSectors)
-	
+
 	compName := []string{"None", "Good", "Best"}
 	compStr := "Unknown"
 	if compression >= 0 && compression < len(compName) {
@@ -131,14 +131,14 @@ func RunWithFile(filepath string) error {
 	if ewfImg.DetectLVM() {
 		fmt.Printf("║ LVM:          %-42s ║\n", "LVM2 Physical Volume detected")
 	}
-	
+
 	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
 
 	// Parse and print MBR
 	if len(ewfImg.Sectors) > 0 && len(ewfImg.Sectors[0].TableEntry) > 0 {
-		FirstSector := ewfImg.ReadAt(int64(ewfImg.Sectors[0].Address)+76, 
+		FirstSector := ewfImg.ReadAt(int64(ewfImg.Sectors[0].Address)+76,
 			int64(ewfImg.Sectors[0].TableEntry[1])-int64(ewfImg.Sectors[0].TableEntry[0]))
-		
+
 		if len(FirstSector) >= 512 {
 			r, err := zlib.NewReader(bytes.NewReader(FirstSector))
 			if err == nil {
@@ -159,7 +159,7 @@ func RunWithFile(filepath string) error {
 
 func formatSize(sectors uint64, sectorSize uint32) string {
 	bytes := sectors * uint64(sectorSize)
-	
+
 	if bytes >= 1024*1024*1024*1024 {
 		return fmt.Sprintf("%.2f TB", float64(bytes)/1024/1024/1024/1024)
 	}

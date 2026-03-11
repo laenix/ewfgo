@@ -58,7 +58,9 @@ type EWFImage struct {
 
 // Close closes the EWF image file.
 func (e *EWFImage) Close() error {
-	// No file handle to close in current implementation
+	if e.ewf != nil {
+		return e.ewf.Close()
+	}
 	return nil
 }
 
@@ -184,6 +186,46 @@ func (e *EWFImage) GetDiskInfo() *DiskInfo {
 		}
 	}
 	return nil
+}
+
+// DebugSections prints detailed section information for debugging
+func (e *EWFImage) DebugSections() {
+	fmt.Printf("=== Section Debug ===\n")
+	fmt.Printf("Total Sections: %d\n", len(e.ewf.Sections))
+	
+	fmt.Printf("\n=== All Sections ===\n")
+	for i, s := range e.ewf.Sections {
+		fmt.Printf("Section %d: Type=%q, Address=%d, NextOffset=%d, Size=%d\n", 
+			i, string(s.SectionTypeDefinition[:]), s.Address, s.NextOffset, s.SectionSize)
+	}
+	
+	fmt.Printf("\n=== Sectors Sections ===\n")
+	fmt.Printf("Total Sectors sections: %d\n", len(e.ewf.SectorsAddress))
+	for i, s := range e.ewf.SectorsAddress {
+		fmt.Printf("SectorSection %d: Address=%d, Size=%d\n", i, s.Address, s.SectionSize)
+	}
+	
+	fmt.Printf("\n=== Table Sections ===\n")
+	fmt.Printf("Total Table sections: %d\n", len(e.ewf.TableAddress))
+	for i, t := range e.ewf.TableAddress {
+		fmt.Printf("TableSection %d: Address=%d, Size=%d\n", i, t.Address, t.SectionSize)
+	}
+	
+	fmt.Printf("\n=== Sectors with Tables ===\n")
+	fmt.Printf("Total Sectors with TableEntry: %d\n", len(e.ewf.Sectors))
+	for i, s := range e.ewf.Sectors {
+		fmt.Printf("Sector[%d]: Address=%d, TableEntries=%d\n", 
+			i, s.Address, len(s.TableEntry))
+	}
+	
+	fmt.Printf("\n=== DiskSMART ===\n")
+	fmt.Printf("Total DiskSMART: %d\n", len(e.ewf.DiskSMART))
+	if len(e.ewf.DiskSMART) > 0 {
+		ds := e.ewf.DiskSMART[0]
+		fmt.Printf("SectorsCount: %d\n", ds.SectorsCount)
+		fmt.Printf("ChunkSectors: %d\n", ds.ChunkSectors)
+		fmt.Printf("SectorBytes: %d\n", ds.SectorBytes)
+	}
 }
 
 // DiskInfo contains disk metadata from the EWF image.
