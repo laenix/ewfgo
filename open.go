@@ -136,39 +136,17 @@ func (e *EWFImage) ReadSectors(lba uint64, count uint64) ([]byte, error) {
 // MBR parses and returns the MBR (Master Boot Record) of the image.
 func (e *EWFImage) MBR() (internal.MBR, error) {
 	var mbr internal.MBR
-	// Check if we have sector data
-	if len(e.ewf.Sectors) == 0 || len(e.ewf.Sectors[0].TableEntry) == 0 {
-		return mbr, fmt.Errorf("no sector data available")
-	}
-	// Read first sector - use correct formula: Address + tableEntry[0]
-	sectorsStart := int64(e.ewf.Sectors[0].Address)
-	firstEntryOffset := int64(e.ewf.Sectors[0].TableEntry[0] & 0x7FFFFFFF)
-	chunkStart := sectorsStart + firstEntryOffset
 	
-	// Read at least 512 bytes
-	chunkSize := int64(512)
-	if len(e.ewf.Sectors[0].TableEntry) > 1 {
-		nextOffset := int64(e.ewf.Sectors[0].TableEntry[1] & 0x7FFFFFFF)
-		if nextOffset > firstEntryOffset {
-			chunkSize = nextOffset - firstEntryOffset
-		}
-	}
-	
-	FirstSector := e.ewf.ReadAt(chunkStart, chunkSize)
-	r, err := zlib.NewReader(bytes.NewReader(FirstSector))
+	// Use ReadSectors to properly read the first sector
+	data, err := e.ReadSectors(0, 1)
 	if err != nil {
-		// If decompression fails, data might not be compressed - use raw data
-		if len(FirstSector) >= 512 {
-			binary.Read(bytes.NewReader(FirstSector[:512]), binary.LittleEndian, &mbr)
-		}
-		return mbr, nil
+		return mbr, fmt.Errorf("failed to read sector 0: %w", err)
 	}
-	defer r.Close()
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	if buf.Len() >= 512 {
-		binary.Read(bytes.NewReader(buf.Bytes()[:512]), binary.LittleEndian, &mbr)
+	
+	if len(data) >= 512 {
+		binary.Read(bytes.NewReader(data[:512]), binary.LittleEndian, &mbr)
 	}
+	
 	return mbr, nil
 }
 
@@ -208,8 +186,6 @@ func (e *EWFImage) GPT() (internal.GPT, error) {
 	// Read the compressed chunk
 	compressed := make([]byte, 32768)
 	file.ReadAt(compressed, chunkStart)
-	
-	fmt.Printf("[DEBUG GPT] compressed[0:16] = % X\n", compressed[:16])
 	
 	// Decompress
 	r, err := zlib.NewReader(bytes.NewReader(compressed))

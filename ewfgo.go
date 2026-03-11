@@ -1,11 +1,7 @@
 package ewf
 
 import (
-	"bytes"
-	"compress/zlib"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 
 	"github.com/laenix/ewfgo/internal"
@@ -133,26 +129,6 @@ func RunWithFile(filepath string) error {
 	}
 
 	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
-
-	// Parse and print MBR
-	if len(ewfImg.Sectors) > 0 && len(ewfImg.Sectors[0].TableEntry) > 0 {
-		FirstSector := ewfImg.ReadAt(int64(ewfImg.Sectors[0].Address)+76,
-			int64(ewfImg.Sectors[0].TableEntry[1])-int64(ewfImg.Sectors[0].TableEntry[0]))
-
-		if len(FirstSector) >= 512 {
-			r, err := zlib.NewReader(bytes.NewReader(FirstSector))
-			if err == nil {
-				var buf bytes.Buffer
-				io.Copy(&buf, r)
-				r.Close()
-				if buf.Len() >= 512 {
-					var mbr internal.MBR
-					binary.Read(bytes.NewReader(buf.Bytes()[:512]), binary.LittleEndian, &mbr)
-					internal.PrintMBR(mbr)
-				}
-			}
-		}
-	}
 
 	return nil
 }

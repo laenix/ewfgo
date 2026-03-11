@@ -111,11 +111,11 @@ func (e *EWFImage) ReadSectorAt(sectorNum int) ([]byte, error) {
 
 	tableEntry := e.Sectors[0].TableEntry
 	chunkOffset := int64(tableEntry[chunkIndex] & 0x7FFFFFFF)
+	// Standard EWF: bit31=1 means compressed, bit31=0 means uncompressed
 	isCompressed := (tableEntry[chunkIndex] & 0x80000000) != 0
 
-	// The table entry is offset from sectors section start
-	sectorsStart := int64(e.Sectors[0].Address)
-	chunkStart := sectorsStart + chunkOffset
+	// Table entry offset is already absolute file offset
+	chunkStart := chunkOffset
 	chunkSize := chunkSectors * sectorSize
 
 	chunkData := e.ReadAt(chunkStart, int64(chunkSize))
@@ -266,13 +266,6 @@ func analyzeMBR(data []byte) string {
 		return "Unknown"
 	}
 
-	// Print partition types for debugging
-	for i, p := range mbr.PartitionTable {
-		if p.PartitionSize > 0 {
-			fmt.Fprintf(os.Stderr, "[analyzeMBR] Partition %d: type=0x%02X size=%d\n", i, p.PartitionType, p.PartitionSize)
-		}
-	}
-
 	// Check for empty MBR
 	if mbr.PartitionTable[0].PartitionSize == 0 && mbr.PartitionTable[1].PartitionSize == 0 {
 		return "Empty/MBR"
@@ -376,15 +369,10 @@ func (e *EWFImage) ReadSectorData(startSector uint64, numSectors uint64) ([]byte
 	// Each section's table covers a range of sectors
 	var sectorSectionOffsets []uint64
 	var cumulativeSectors uint64 = 0
-	for i, s := range e.Sectors {
+	for _, s := range e.Sectors {
 		sectorSectionOffsets = append(sectorSectionOffsets, cumulativeSectors)
 		sectionSectors := uint64(len(s.TableEntry)) * chunkSectors
 		cumulativeSectors += sectionSectors
-		if i == 0 {
-			// Debug: show first section info
-			fmt.Printf("[DEBUG ReadSectorData] Section 0: TableEntries=%d, chunkSectors=%d, covers sectors %d-%d\n",
-				len(s.TableEntry), chunkSectors, sectorSectionOffsets[i], cumulativeSectors-1)
-		}
 	}
 
 	// Find which sector section contains the requested startSector
@@ -404,30 +392,6 @@ func (e *EWFImage) ReadSectorData(startSector uint64, numSectors uint64) ([]byte
 	sectionStartSector := sectorSectionOffsets[sectionIndex]
 	tableEntry := e.Sectors[sectionIndex].TableEntry
 	
-	// Get the sectors section start address from the section
-	// This is the file offset where the sectors section header starts
-	sectorsSectionStart := e.Sectors[sectionIndex].Address
-	
-	maxSectors := uint64(len(tableEntry)) * chunkSectors
-
-	fmt.Printf("[DEBUG ReadSectorData] Using section %d (starts at sector %d), Table entries: %d, max addressable: %d\n",
-		sectionIndex, sectionStartSector, len(tableEntry), maxSectors)
-	fmt.Printf("[DEBUG ReadSectorData] Requested: startSector=%d (relative: %d), numSectors=%d\n",
-		startSector, startSector-sectionStartSector, numSectors)
-
-	// Show first few table entries
-	if len(tableEntry) > 0 {
-		for i := 0; i < 3 && i < len(tableEntry); i++ {
-			offset := tableEntry[i] & 0x7FFFFFFF
-			compressed := (tableEntry[i] & 0x80000000) != 0
-			compStr := "uncompressed"
-			if compressed {
-				compStr = "compressed"
-			}
-			fmt.Printf("[DEBUG ReadSectorData] Table[%d]: offset=%d (%s)\n", i, offset, compStr)
-		}
-	}
-
 	totalBytes := numSectors * sectorSize
 	result := make([]byte, 0, totalBytes)
 
@@ -454,26 +418,15 @@ func (e *EWFImage) ReadSectorData(startSector uint64, numSectors uint64) ([]byte
 			return nil, fmt.Errorf("sector %d out of range (max chunk: %d)", sectorNum, len(tableEntry))
 		}
 
+		// Table entry offset is ALREADY the absolute file offset, not relative to sectors section!
 		chunkOffset := int64(tableEntry[chunkIndex] & 0x7FFFFFFF)
 		
-		// For FTK Imager E01 format, bit 31=1 means uncompressed (opposite of standard EWF!)
-		// Try decompressing if either the flag says compressed OR decompression works
+		// Standard EWF: bit31=1 means compressed, bit31=0 means uncompressed
 		rawEntry := tableEntry[chunkIndex]
-		bit31Set := (rawEntry & 0x80000000) != 0
-		
-		// Debug: show the raw entry
-		if sectorNum < 5 {
-			fmt.Printf("[DEBUG] sectorNum=%d, chunkIndex=%d, rawEntry=0x%08x, bit31Set=%v\n",
-				sectorNum, chunkIndex, rawEntry, bit31Set)
-		}
-		
-		// FTK Imager: if bit31 is CLEAR, data is compressed; if SET, it's uncompressed
-		// This is the reverse of standard libewf behavior
-		isCompressed := !bit31Set
+		isCompressed := (rawEntry & 0x80000000) != 0
 
-		// Read the chunk from sectors section
-		// The table entry is an offset FROM the sectors section start
-		chunkStart := sectorsSectionStart + chunkOffset
+		// Read chunk directly from file (offset is absolute, not relative)
+		chunkStart := chunkOffset
 		chunkSize := int(chunkBytes)
 		chunkData := e.ReadAt(chunkStart, int64(chunkSize))
 
@@ -489,12 +442,18 @@ func (e *EWFImage) ReadSectorData(startSector uint64, numSectors uint64) ([]byte
 				// If decompression fails, treat as uncompressed
 				decompressed = chunkData[:chunkSize]
 			} else {
-				decompressed, _ = io.ReadAll(r)
+				decompressed, err = io.ReadAll(r)
 				r.Close()
+				if err != nil {
+					// If read fails, use raw data
+					decompressed = chunkData[:chunkSize]
+				}
 			}
 		} else {
 			decompressed = chunkData[:chunkSize]
 		}
+		
+
 
 		// Extract the specific sector from the chunk
 		offset := int(offsetInChunk) * int(sectorSize)
@@ -563,30 +522,12 @@ func (e *EWFImage) ParseSections() error {
 			e.ParseVolume(v)
 		case "disk":
 			e.ParseVolume(v)
-		case "data":
-			fmt.Println("data")
 		case "sectors":
 			e.AddSectorsAddress(v)
 		case "table":
 			e.AddTableAddress(v)
 		case "table2":
 			e.ParseTable2(v)
-		case "next":
-			fmt.Println("next")
-		case "ltype":
-			fmt.Println("ltype")
-		case "ltree":
-			fmt.Println("ltree")
-		case "map":
-			fmt.Println("map")
-		case "error2":
-			fmt.Println("error2")
-		case "digest":
-			fmt.Println("digest")
-		case "hash":
-			fmt.Println("hash")
-		case "done":
-			fmt.Println("done")
 		}
 	}
 
@@ -778,13 +719,8 @@ func (e *EWFImage) ParseTable(s SectionWithAddress) ([]uint32, error) {
 	len := ((int64(s.SectionSize) - SectionLength - TableSectionLength) / 4) - 1
 	tableEntry := make([]uint32, len)
 	err = binary.Read(bytes.NewReader(buf), binary.LittleEndian, &tableEntry)
-	if err != nil {
-		return nil, err
-	}
-	for k, entry := range tableEntry {
-		tableEntry[k] = entry & 0x7FFFFFFF
-	}
-	return tableEntry, nil
+	// DO NOT mask off bit 31 - it contains the compression flag!
+	return tableEntry, err
 }
 
 // 3.10 Table2

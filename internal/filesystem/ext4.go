@@ -38,10 +38,13 @@ func NewExt4Handler(reader Reader, startLBA uint64) (*Ext4Handler, error) {
 func (h *Ext4Handler) readSuperblock() error {
 	// Read more sectors to find superblock (might be at LBA 1-2, not LBA 0)
 	// Superblock is typically at offset 1024 (1KB) from filesystem start
+	fmt.Printf("[ext4] Reading superblock: startLBA=%d, reading 16 sectors\n", h.startLBA)
 	sbData, err := h.reader.ReadSectors(h.startLBA, 16)
 	if err != nil {
 		return fmt.Errorf("failed to read superblock: %w", err)
 	}
+	
+	fmt.Printf("[ext4] Read %d bytes, checking for magic at various offsets\n", len(sbData))
 	
 	// Search for ext4 magic (0x53EF) at common offsets
 	// For 1KB block size: superblock at offset 1024 (sector 2)
@@ -129,27 +132,35 @@ func (h *Ext4Handler) readDirectory(inodeNum uint32) ([]DirectoryEntry, error) {
 	groupDescOffset := gdtBlock*uint64(h.blockSize) + uint64(groupNum)*64
 	groupDescSector := uint64(groupDescOffset) / 512
 	
-	fmt.Printf("[ext4] Reading GDT at sector %d (offset %d)\n", groupDescSector, groupDescOffset)
+	targetLBA := h.startLBA + groupDescSector
+	fmt.Printf("[ext4] Reading GDT: groupDescOffset=%d, groupDescSector=%d, targetLBA=%d\n", 
+		groupDescOffset, groupDescSector, targetLBA)
 	
-	groupDescData, err := h.reader.ReadSectors(h.startLBA+groupDescSector, 8)
+	groupDescData, err := h.reader.ReadSectors(targetLBA, 8)
+	fmt.Printf("[ext4] ReadSectors returned: len=%d, err=%v\n", len(groupDescData), err)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read group descriptor: %w", err)
+		return nil, fmt.Errorf("failed to read group descriptor (LBA %d): %w", targetLBA, err)
 	}
 	
 	groupDesc := groupDescData[groupDescOffset%512:]
 	
 	// Get inode table block
 	inodeTableBlock := binary.LittleEndian.Uint32(groupDesc[0x08:])
+	fmt.Printf("[ext4] inodeTableBlock=%d, groupDesc[0x08:0x0C]=% X\n", inodeTableBlock, groupDesc[0x08:0x0C])
 	
 	// Calculate inode offset within table
 	inodeOffset := uint64(inodeIndex) * uint64(h.inodeSize)
 	inodeSector := (uint64(inodeTableBlock)*uint64(h.blockSize) + inodeOffset) / 512
+	fmt.Printf("[ext4] inodeOffset=%d, inodeSector=%d\n", inodeOffset, inodeSector)
 	
 	inodeSizeSectors := (uint64(h.inodeSize) * 2) / 512
 	if inodeSizeSectors < 1 {
 		inodeSizeSectors = 1
 	}
-	inodeData, err := h.reader.ReadSectors(h.startLBA+inodeSector, inodeSizeSectors)
+	inodeTargetLBA := h.startLBA + inodeSector
+	fmt.Printf("[ext4] Reading inode: targetLBA=%d, sectors=%d\n", inodeTargetLBA, inodeSizeSectors)
+	inodeData, err := h.reader.ReadSectors(inodeTargetLBA, inodeSizeSectors)
+	fmt.Printf("[ext4] Inode read: len=%d, err=%v\n", len(inodeData), err)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read inode: %w", err)
 	}
@@ -163,17 +174,50 @@ func (h *Ext4Handler) readDirectory(inodeNum uint32) ([]DirectoryEntry, error) {
 		return nil, fmt.Errorf("inode is not a directory")
 	}
 	
-	// Get block pointers (i_block array at offset 0x28)
-	// For simplicity, use first block
+	// Get block pointer - check for extent format first
 	blockPtr := binary.LittleEndian.Uint32(inode[0x28:])
-	if blockPtr == 0 {
+	
+	// Check for extent magic at offset 0x28
+	extentMagic := binary.LittleEndian.Uint16(inode[0x28:0x2A])
+	fmt.Printf("[ext4] Checking extent: magic=0x%04X\n", extentMagic)
+	
+	if extentMagic == 0xF30A {
+		// Extent format
+		extent := inode[0x28:]
+		eh_entries := binary.LittleEndian.Uint16(extent[2:4])
+		eh_depth := binary.LittleEndian.Uint16(extent[6:8])
+		fmt.Printf("[ext4] Extent: entries=%d, depth=%d\n", eh_entries, eh_depth)
+		
+		if eh_depth == 0 && eh_entries > 0 {
+			// Leaf node - first extent starts at offset 12 (after 12-byte header)
+			ee_len := binary.LittleEndian.Uint16(extent[12:14])
+			ee_start_lo := binary.LittleEndian.Uint32(extent[14:18])
+			blockPtr = ee_start_lo
+			fmt.Printf("[ext4] Extent leaf: len=%d, block=%d\n", ee_len, blockPtr)
+		} else if eh_depth > 0 {
+			// Need to traverse tree - for now, use first child
+			// Index entries start at offset 12
+			ei_blk := binary.LittleEndian.Uint32(extent[12:16])
+			fmt.Printf("[ext4] Extent index: first_block=%d (depth=%d, need tree walk)\n", 
+				ei_blk, eh_depth)
+		}
+	}
+	
+	blockPtrValue := blockPtr
+	fmt.Printf("[ext4] blockPtr=%d, blockSize=%d\n", blockPtrValue, h.blockSize)
+	
+	if blockPtrValue == 0 {
 		return nil, fmt.Errorf("directory has no data blocks")
 	}
 	
 	// Read directory data
-	dirSector := (uint64(blockPtr) * uint64(h.blockSize)) / 512
+	dirSector := (uint64(blockPtrValue) * uint64(h.blockSize)) / 512
 	blockSectors := uint64(h.blockSize) / 512 * 4
-	dirData, err := h.reader.ReadSectors(h.startLBA+dirSector, blockSectors)
+	dirLBA := h.startLBA + dirSector
+	fmt.Printf("[ext4] Reading directory: dirSector=%d, blockSectors=%d, dirLBA=%d\n", 
+		dirSector, blockSectors, dirLBA)
+	dirData, err := h.reader.ReadSectors(dirLBA, blockSectors)
+	fmt.Printf("[ext4] Directory read: len=%d, err=%v\n", len(dirData), err)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read directory: %w", err)
 	}
