@@ -29,32 +29,31 @@
 - 起始LBA: 63
 - 大小: 58.04 GB
 
-### FAT32 参数
-- BytesPerSector: 512
-- SectorsPerCluster: 64
-- Reserved: 38
-- NumFATs: 2
-- SectorsPerFAT32: 14905
-- RootCluster: 2
-- TotalSectors: 121728961
-- 计算得到: fatStart=101, dataAreaStart=29911, rootDirLBA=29911
-
-### 根目录列表
-```
+### 目录浏览测试
+```bash
+# 根目录
+$ ewftool video.E01 ls
 Found 2 entries:
-  [DIR ] VIDEO                                   0 bytes
-  [DIR ] SYSTEM~1                                0 bytes
+  [DIR ] VIDEO
+  [DIR ] SYSTEM~1
+
+# VIDEO 目录
+$ ewftool video.E01 ls VIDEO
+Found 3 entries:
+  [DIR ] .
+  [DIR ] ..
+  [DIR ] 00
+
+# VIDEO/00/20250416/0000-0~1 目录
+$ ewftool video.E01 ls VIDEO/00/20250416/0000-0~1
+Found 17 entries:
+  [FILE] 004745~1.TS    8266924 bytes
+  [FILE] 003530~2.TS    8961020 bytes
+  [FILE] 003659~2.TS   10058940 bytes
+  ...
 ```
 
-### 对比 ewflib
-```
-d/d 4:	video
-d/d 3518469:	video/00
-d/d 3519493:	video/00/20250416
-...
-```
-
-**结论**: ✅ FAT32 根目录工作正常，UTF-16LE中文文件名解码正确
+**结论**: ✅ FAT32 子目录浏览完全工作，支持多级目录遍历，文件大小正确
 
 ---
 
@@ -121,10 +120,25 @@ Partition 1: GPT Protective | GPT | LBA 1 | 2.00 TB
 
 ---
 
+## 完成的功能
+
+| 功能 | 状态 |
+|------|------|
+| FAT32 根目录列表 | ✅ |
+| FAT32 子目录浏览 | ✅ (2026-03-11) |
+| FAT32 文件大小 | ✅ |
+| NTFS 系统文件 | ✅ |
+| MBR 分区解析 | ✅ |
+| GPT 分区解析 | ❌ |
+| LVM 支持 | ❌ |
+| NTFS 真实目录 | ❌ |
+
+---
+
 ## 待实现功能
 
-1. ✅ ~~NTFS 目录列表~~ - 已完成
-2. **子目录浏览** - 实现目录遍历
-3. **GPT 分区解析** - 解析实际 GPT 分区表
-4. **LVM 支持** - 解析 LVM PV 和 LV
-5. **ext4 目录列表** - 针对不同 block size 调整
+1. ✅ ~~FAT32 子目录浏览~~ - 已完成
+2. **NTFS 真实目录列表** - 实现 $INDEX_ROOT 解析
+3. **ext4 目录列表** - 针对不同 block size 调整
+4. **GPT 分区解析** - 解析实际 GPT 分区表
+5. **LVM 支持** - 解析 LVM PV 和 LV
