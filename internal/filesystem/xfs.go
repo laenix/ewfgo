@@ -9,10 +9,11 @@ import (
 // Reference: https://www.kernel.org/doc/Documentation/filesystems/xfs.txt
 
 type XFS struct {
-	blocksize       uint32
-	agblocks        uint32
-	agcount         uint32
-	dirblocksize    uint32
+	startLBA       uint64
+	blocksize      uint32
+	agblocks       uint32
+	agcount        uint32
+	dirblocksize   uint32
 	uuid           [16]byte
 	volumeName     string
 
@@ -22,6 +23,7 @@ type XFS struct {
 // NewXFSHandler creates a new XFS filesystem handler
 func NewXFSHandler(reader Reader, startLBA uint64) (*XFS, error) {
 	xfs := &XFS{
+		startLBA:  startLBA,
 		readFunc: reader.ReadSectors,
 	}
 	
@@ -109,31 +111,153 @@ func (xfs *XFS) GetVolumeLabel() string {
 }
 
 func (xfs *XFS) ListDirectory(path string) ([]DirectoryEntry, error) {
-	// Common Linux directories
-	if path == "/" || path == "" {
-		return []DirectoryEntry{
-			{Name: "bin", Path: "/bin", IsDir: true, Size: 0},
-			{Name: "boot", Path: "/boot", IsDir: true, Size: 0},
-			{Name: "dev", Path: "/dev", IsDir: true, Size: 0},
-			{Name: "etc", Path: "/etc", IsDir: true, Size: 0},
-			{Name: "home", Path: "/home", IsDir: true, Size: 0},
-			{Name: "lib", Path: "/lib", IsDir: true, Size: 0},
-			{Name: "lib64", Path: "/lib64", IsDir: true, Size: 0},
-			{Name: "media", Path: "/media", IsDir: true, Size: 0},
-			{Name: "mnt", Path: "/mnt", IsDir: true, Size: 0},
-			{Name: "opt", Path: "/opt", IsDir: true, Size: 0},
-			{Name: "proc", Path: "/proc", IsDir: true, Size: 0},
-			{Name: "root", Path: "/root", IsDir: true, Size: 0},
-			{Name: "run", Path: "/run", IsDir: true, Size: 0},
-			{Name: "sbin", Path: "/sbin", IsDir: true, Size: 0},
-			{Name: "srv", Path: "/srv", IsDir: true, Size: 0},
-			{Name: "sys", Path: "/sys", IsDir: true, Size: 0},
-			{Name: "tmp", Path: "/tmp", IsDir: true, Size: 0},
-			{Name: "usr", Path: "/usr", IsDir: true, Size: 0},
-			{Name: "var", Path: "/var", IsDir: true, Size: 0},
-		}, nil
+	// For now, only support root directory
+	if path != "/" && path != "" {
+		return nil, fmt.Errorf("XFS: only root directory supported")
 	}
-	return nil, fmt.Errorf("directory not found")
+	
+	// Read root directory from XFS
+	// Root inode is at block 0, offset calculated from AG params
+	entries, err := xfs.readRootDirectory()
+	if err != nil {
+		return nil, err
+	}
+	
+	return entries, nil
+}
+
+// readRootDirectory reads the root directory entries from XFS
+func (xfs *XFS) readRootDirectory() ([]DirectoryEntry, error) {
+	// Read superblock to get root inode
+	superblock, err := xfs.readSuperblock()
+	if err != nil {
+		return nil, err
+	}
+	
+	// Read root inode
+	rootIno, err := xfs.readInode(superblock.RootInode)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Read directory data
+	return xfs.readDirectory(rootIno)
+}
+
+// readSuperblock reads the XFS superblock
+func (xfs *XFS) readSuperblock() (*XFSSuperblockData, error) {
+	data, err := xfs.readFunc(xfs.startLBA, 8)
+	if err != nil {
+		return nil, fmt.Errorf("XFS: failed to read superblock: %w", err)
+	}
+	
+	if len(data) < 512 || string(data[0:4]) != "XFSB" {
+		return nil, fmt.Errorf("XFS: invalid superblock")
+	}
+	
+	super := &XFSSuperblockData{}
+	// Parse superblock - all fields are big-endian
+	super.BlockSize = binary.BigEndian.Uint32(data[4:8])
+	super.RootInode = binary.BigEndian.Uint64(data[72:80])
+	super.AgBlocks = binary.BigEndian.Uint32(data[36:40])
+	super.InodeSize = binary.BigEndian.Uint16(data[44:46])
+	
+	return super, nil
+}
+
+// XFSSuperblockData holds parsed superblock information
+type XFSSuperblockData struct {
+	BlockSize  uint32
+	RootInode  uint64
+	AgBlocks   uint32
+	InodeSize  uint16
+}
+
+// readInode reads an inode by number
+func (xfs *XFS) readInode(inoNum uint64) ([]byte, error) {
+	// Calculate which AG and offset within AG
+	// For simplicity, assume inode size = 256 and 64 inodes per block
+	agSize := uint64(xfs.blocksize / 256 * 64) // rough estimate
+	if agSize == 0 {
+		agSize = 8192 // default
+	}
+	
+	agNum := inoNum / agSize
+	inoOffset := inoNum % agSize
+	
+	// Calculate LBA: AG starts at certain offset + inode table offset
+	// For AG 0, inode table typically starts at block 8 (for 4KB blocks)
+	inodeTableStart := uint64(8 * 4096 / 512) // block 8 in sectors
+	inoSector := agNum*uint64(xfs.agblocks) + inodeTableStart + inoOffset
+	
+	// Read inode
+	data, err := xfs.readFunc(inoSector, 2)
+	if err != nil {
+		return nil, fmt.Errorf("XFS: failed to read inode %d: %w", inoNum, err)
+	}
+	
+	return data, nil
+}
+
+// readDirectory reads directory entries from an inode
+func (xfs *XFS) readDirectory(inodeData []byte) ([]DirectoryEntry, error) {
+	if len(inodeData) < 256 {
+		return nil, fmt.Errorf("XFS: inode data too small")
+	}
+	
+	// Check if inline directory (format = 1 at offset 0x47)
+	format := inodeData[0x47]
+	
+	// For inline directories, data starts at offset 0x80
+	if format == 1 {
+		return xfs.parseInlineDirectory(inodeData[0x80:])
+	}
+	
+	// For B+tree directories, not supported yet
+	return nil, fmt.Errorf("XFS: B+tree directory format not supported")
+}
+
+// parseInlineDirectory parses inline directory entries
+func (xfs *XFS) parseInlineDirectory(data []byte) ([]DirectoryEntry, error) {
+	var entries []DirectoryEntry
+	
+	// XFS inline directory format:
+	// - 4 bytes: magic (0x58414444 = "XADD")
+	// - 4 bytes: number of entries
+	// - Then entries: 1 byte name_len + 1 byte ftype + 8 bytes inode + variable name
+	
+	offset := 0
+	if len(data) < 8 {
+		return nil, fmt.Errorf("XFS: inline directory data too small")
+	}
+	
+	// Skip header, read entries
+	numEntries := binary.BigEndian.Uint32(data[4:8])
+	offset = 8
+	
+	for i := 0; i < int(numEntries) && offset+10 < len(data); i++ {
+		nameLen := int(data[offset])
+		ftype := data[offset+1]
+		// ino := binary.BigEndian.Uint64(data[offset+2:offset+10]) // unused for now
+		name := string(data[offset+10:offset+10+nameLen])
+		
+		offset += 10 + nameLen
+		
+		entry := DirectoryEntry{
+			Name:   name,
+			Path:   "/" + name,
+			IsDir:  ftype == 2, // ftype 2 = directory
+			Size:   0,
+		}
+		entries = append(entries, entry)
+	}
+	
+	// No fake data - return error if no entries found
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("XFS: directory parsing not fully implemented")
+	}
+	
+	return entries, nil
 }
 
 func (xfs *XFS) GetFile(path string) ([]byte, error) {
