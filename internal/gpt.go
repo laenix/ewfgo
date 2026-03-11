@@ -2,10 +2,8 @@ package internal
 
 import (
 	"bytes"
-	"compress/zlib"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"unicode/utf16"
 )
 
@@ -42,12 +40,37 @@ type GPTPartitionTable struct {
 }
 
 func ParseGPT(ewf *EWFImage) {
-	FirstSector := ewf.ReadAt(int64(ewf.Sectors[0].Address)+76, int64(ewf.Sectors[0].TableEntry[1])-int64(ewf.Sectors[0].TableEntry[0]))
-	r, _ := zlib.NewReader(bytes.NewReader(FirstSector))
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
+	// Read GPT header - use correct offset formula
+	sectorsStart := int64(ewf.Sectors[0].Address)
+	firstEntryOffset := int64(ewf.Sectors[0].TableEntry[0] & 0x7FFFFFFF)
+	chunkStart := sectorsStart + firstEntryOffset
+	
+	// Read GPT header at LBA 1 (sector 1)
+	FirstSector := ewf.ReadAt(chunkStart, 512)
+	
+	// Check if GPT signature exists (might not be compressed)
+	gptData := FirstSector
+	
+	// Try to find GPT header
 	var gpt GPT
-	binary.Read(bytes.NewReader(buf.Bytes()[512:512+16896]), binary.LittleEndian, &gpt)
+	found := false
+	for offset := 0; offset < 4096; offset += 512 {
+		if offset+512 > len(gptData) {
+			break
+		}
+		if string(gptData[offset:offset+8]) == "EFI PART" {
+			binary.Read(bytes.NewReader(gptData[offset:offset+512]), binary.LittleEndian, &gpt.GPTHeader)
+			found = true
+			fmt.Printf("Found GPT header at offset %d\n", offset)
+			break
+		}
+	}
+	
+	if !found {
+		fmt.Println("GPT header not found")
+		return
+	}
+	
 	PrintGPT(gpt)
 }
 

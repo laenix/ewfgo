@@ -144,46 +144,122 @@ func (e *EWFImage) MBR() (internal.MBR, error) {
 	sectorsStart := int64(e.ewf.Sectors[0].Address)
 	firstEntryOffset := int64(e.ewf.Sectors[0].TableEntry[0] & 0x7FFFFFFF)
 	chunkStart := sectorsStart + firstEntryOffset
-	chunkSize := int64(e.ewf.Sectors[0].TableEntry[1]) - chunkStart
+	
+	// Read at least 512 bytes
+	chunkSize := int64(512)
+	if len(e.ewf.Sectors[0].TableEntry) > 1 {
+		nextOffset := int64(e.ewf.Sectors[0].TableEntry[1] & 0x7FFFFFFF)
+		if nextOffset > firstEntryOffset {
+			chunkSize = nextOffset - firstEntryOffset
+		}
+	}
 	
 	FirstSector := e.ewf.ReadAt(chunkStart, chunkSize)
 	r, err := zlib.NewReader(bytes.NewReader(FirstSector))
 	if err != nil {
 		// If decompression fails, data might not be compressed - use raw data
-		binary.Read(bytes.NewReader(FirstSector[:512]), binary.LittleEndian, &mbr)
+		if len(FirstSector) >= 512 {
+			binary.Read(bytes.NewReader(FirstSector[:512]), binary.LittleEndian, &mbr)
+		}
 		return mbr, nil
 	}
 	defer r.Close()
 	var buf bytes.Buffer
 	io.Copy(&buf, r)
-	binary.Read(bytes.NewReader(buf.Bytes()[:512]), binary.LittleEndian, &mbr)
+	if buf.Len() >= 512 {
+		binary.Read(bytes.NewReader(buf.Bytes()[:512]), binary.LittleEndian, &mbr)
+	}
 	return mbr, nil
 }
 
 // GPT parses and returns the GPT (GUID Partition Table) of the image.
 func (e *EWFImage) GPT() (internal.GPT, error) {
 	var gpt internal.GPT
+	
 	// Check if we have sector data
 	if len(e.ewf.Sectors) == 0 || len(e.ewf.Sectors[0].TableEntry) == 0 {
 		return gpt, fmt.Errorf("no sector data available")
 	}
-	// Read first sector with GPT - use correct formula
+	
+	// Read GPT data - need to read raw compressed data and decompress
 	sectorsStart := int64(e.ewf.Sectors[0].Address)
 	firstEntryOffset := int64(e.ewf.Sectors[0].TableEntry[0] & 0x7FFFFFFF)
-	chunkStart := sectorsStart + firstEntryOffset
-	chunkSize := int64(e.ewf.Sectors[0].TableEntry[1]) - chunkStart
 	
-	FirstSector := e.ewf.ReadAt(chunkStart, chunkSize)
-	r, err := zlib.NewReader(bytes.NewReader(FirstSector))
-	if err != nil {
-		// If decompression fails, data might not be compressed - use raw data
-		binary.Read(bytes.NewReader(FirstSector[512:512+16896]), binary.LittleEndian, &gpt)
-		return gpt, nil
+	// Check if data is compressed (FTK Imager: bit31 clear = compressed)
+	bit31Set := (e.ewf.Sectors[0].TableEntry[0] & 0x80000000) != 0
+	isCompressed := !bit31Set
+	
+	var chunkStart int64
+	if isCompressed {
+		// For compressed data, table entry is absolute file offset
+		chunkStart = firstEntryOffset
+	} else {
+		// For uncompressed, add sectors section address
+		chunkStart = sectorsStart + firstEntryOffset
 	}
-	defer r.Close()
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	binary.Read(bytes.NewReader(buf.Bytes()[512:512+16896]), binary.LittleEndian, &gpt)
+	
+	// Read raw file to get compressed data
+	file, err := os.Open(e.ewf.Filepath())
+	if err != nil {
+		return gpt, fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+	
+	// Read the compressed chunk
+	compressed := make([]byte, 32768)
+	file.ReadAt(compressed, chunkStart)
+	
+	fmt.Printf("[DEBUG GPT] compressed[0:16] = % X\n", compressed[:16])
+	
+	// Decompress
+	r, err := zlib.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		return gpt, fmt.Errorf("failed to decompress: %w", err)
+	}
+	decompressed, _ := io.ReadAll(r)
+	r.Close()
+	
+	// Search for GPT header in decompressed data
+	found := false
+	for offset := 0; offset < len(decompressed)-8; offset += 512 {
+		if string(decompressed[offset:offset+8]) == "EFI PART" {
+			// Parse GPT header
+			hdr := decompressed[offset:offset+92]
+			copy(gpt.GPTHeader.Signature[:], hdr[:8])
+			gpt.GPTHeader.Version = binary.LittleEndian.Uint32(hdr[8:12])
+			gpt.GPTHeader.HeaderSize = binary.LittleEndian.Uint32(hdr[12:16])
+			gpt.GPTHeader.CurrentLBA = binary.LittleEndian.Uint64(hdr[24:32])
+			gpt.GPTHeader.FirstLBA = binary.LittleEndian.Uint64(hdr[32:40])
+			gpt.GPTHeader.LastLBA = binary.LittleEndian.Uint64(hdr[40:48])
+			gpt.GPTHeader.PartitionStartLBA = binary.LittleEndian.Uint64(hdr[72:80])
+			gpt.GPTHeader.PartitionNumber = binary.LittleEndian.Uint32(hdr[80:84])
+			gpt.GPTHeader.PartitionSize = binary.LittleEndian.Uint32(hdr[84:88])
+			found = true
+			break
+		}
+	}
+	
+	if !found {
+		return gpt, fmt.Errorf("GPT header not found in decompressed data")
+	}
+	
+	// Read partition table
+	partTableOffset := int(gpt.GPTHeader.PartitionStartLBA * 512)
+	if partTableOffset+128 <= len(decompressed) {
+		for i := 0; i < 128 && i*128+128 <= len(decompressed)-partTableOffset; i++ {
+			part := decompressed[partTableOffset+i*128 : partTableOffset+(i+1)*128]
+			startLBA := binary.LittleEndian.Uint64(part[32:40])
+			endLBA := binary.LittleEndian.Uint64(part[40:48])
+			if startLBA > 0 {
+				gpt.GPTPartitionTable[i].StartLBA = startLBA
+				gpt.GPTPartitionTable[i].EndLBA = endLBA
+				copy(gpt.GPTPartitionTable[i].PartitionTypeGUID[:], part[0:16])
+				copy(gpt.GPTPartitionTable[i].PartitionGUID[:], part[16:32])
+				copy(gpt.GPTPartitionTable[i].PartitionName[:], part[48:80])
+			}
+		}
+	}
+	
 	return gpt, nil
 }
 
@@ -337,10 +413,69 @@ type PartitionInfo struct {
 func (e *EWFImage) ScanFileSystems() ([]PartitionInfo, error) {
 	var partitions []PartitionInfo
 
-	// Try MBR first
+	// Try GPT first (check if GPT protective MBR exists)
 	mbr, err := e.MBR()
 	if err == nil {
-		// Got MBR, parse partitions
+		// Check for GPT protective partition (type 0xEE) or very large partition (>1TB suggests GPT)
+		hasGPT := false
+		for _, p := range mbr.PartitionTable {
+			if p.PartitionType == 0xEE || (p.PartitionType == 0x9C && p.PartitionSize > 2000000) {
+				hasGPT = true
+				break
+			}
+		}
+		
+		// If GPT protective partition found, try GPT parsing
+		if hasGPT {
+			gpt, gptErr := e.GPT()
+			if gptErr == nil && string(gpt.GPTHeader.Signature[:]) == "EFI PART" {
+				// Parse GPT partitions
+				idx := 1
+				for i := 0; i < 128; i++ {
+					if gpt.GPTPartitionTable[i].StartLBA > 0 {
+						startLBA := gpt.GPTPartitionTable[i].StartLBA
+						endLBA := gpt.GPTPartitionTable[i].EndLBA
+						
+						// Try to detect filesystem by reading partition
+						fsType := "Unknown"
+						partSector, err := e.ReadSectors(startLBA, 8)
+						if err == nil {
+							fsType = DetectFileSystem(partSector)
+						}
+						
+						// Override with GUID-based guess if still unknown
+						if fsType == "Unknown" {
+							partTypeGUID := gpt.GPTPartitionTable[i].PartitionTypeGUID
+							// Check for EFI System Partition (FAT)
+							if len(partTypeGUID) >= 16 && 
+							   partTypeGUID[15] == 0xEF {
+								fsType = "EFI"
+							}
+						}
+						
+						pi := PartitionInfo{
+							Index:          idx,
+							StartSector:    startLBA,
+							SizeSectors:    endLBA - startLBA + 1,
+							SizeBytes:      (endLBA - startLBA + 1) * 512,
+							Type:           "GPT",
+							TypeCode:       0xEE,
+							TypeName:       "GPT",
+							FileSystem:     fsType,
+						}
+						partitions = append(partitions, pi)
+						idx++
+					}
+				}
+				
+				// If we got GPT partitions, return them
+				if len(partitions) > 0 {
+					return partitions, nil
+				}
+			}
+		}
+		
+		// Fall back to MBR parsing
 		for i, p := range mbr.PartitionTable {
 			if p.PartitionSize > 0 && p.PartitionType != 0x00 {
 				pi := PartitionInfo{
@@ -355,7 +490,6 @@ func (e *EWFImage) ScanFileSystems() ([]PartitionInfo, error) {
 				}
 
 				// Try to detect filesystem in this partition
-				// Read more sectors to allow for partition alignment
 				if p.PartitionSize > 10 {
 					partSector, err := e.ReadSectors(uint64(p.StartLBA), 8)
 					if err == nil {

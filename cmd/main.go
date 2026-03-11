@@ -53,12 +53,18 @@ func main() {
 		showFilesystems(img)
 
 	case "ls":
-		// Optional path argument
+		// Optional: partition index and path argument
+		// Usage: ls [partition#] [path]
+		partitionIndex := 0
 		dirPath := ""
 		if len(os.Args) >= 4 {
-			dirPath = os.Args[3]
+			// Check if first arg is a number (partition index)
+			fmt.Sscanf(os.Args[3], "%d", &partitionIndex)
+			if len(os.Args) >= 5 {
+				dirPath = os.Args[4]
+			}
 		}
-		listDirectory(img, dirPath)
+		listDirectoryPartition(img, partitionIndex, dirPath)
 		// Try actual file reading too
 		testFileReading(img)
 
@@ -124,6 +130,10 @@ func showFilesystems(img *ewf.EWFImage) {
 }
 
 func listDirectory(img *ewf.EWFImage, dirPath string) {
+	listDirectoryPartition(img, 0, dirPath)
+}
+
+func listDirectoryPartition(img *ewf.EWFImage, partitionIndex int, dirPath string) {
 	fmt.Println("╔═══════════════════════════════════════════════════════════════╗")
 	fmt.Println("║              Root Directory Listing                   ║")
 	fmt.Println("╠═══════════════════════════════════════════════════════════════╣")
@@ -136,7 +146,14 @@ func listDirectory(img *ewf.EWFImage, dirPath string) {
 		return
 	}
 	
-	p := parts[0]
+	idx := partitionIndex
+	if idx < 0 || idx >= len(parts) {
+		fmt.Printf("║ Invalid partition index %d (max %d)                          ║\n", idx, len(parts)-1)
+		fmt.Println("╚═══════════════════════════════════════════════════════════════╝")
+		return
+	}
+	
+	p := parts[idx]
 	fmt.Printf("║ Partition %d: %s at LBA %-10d                  ║\n", p.Index, p.FileSystem, p.StartSector)
 	
 	if dirPath != "" {
@@ -146,7 +163,7 @@ func listDirectory(img *ewf.EWFImage, dirPath string) {
 	fmt.Println("╠═══════════════════════════════════════════════════════════════╣")
 	
 	// Try to list files
-	entries, err := img.ListDirectory(0, dirPath)
+	entries, err := img.ListDirectory(idx, dirPath)
 	if err != nil {
 		errStr := err.Error()
 		if len(errStr) > 48 {
