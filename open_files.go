@@ -6,7 +6,13 @@ import (
 
 // ListFiles lists files in the specified partition.
 // Returns directory entries for the root of the specified partition.
+// This is a convenience method that calls ListDirectory with empty path.
 func (e *EWFImage) ListFiles(partitionIndex int) ([]filesystem.DirectoryEntry, error) {
+	return e.ListDirectory(partitionIndex, "")
+}
+
+// ListDirectory lists files in a specific directory path within a partition.
+func (e *EWFImage) ListDirectory(partitionIndex int, dirPath string) ([]filesystem.DirectoryEntry, error) {
 	parts, err := e.ScanFileSystems()
 	if err != nil || len(parts) == 0 {
 		return nil, err
@@ -30,38 +36,19 @@ func (e *EWFImage) ListFiles(partitionIndex int) ([]filesystem.DirectoryEntry, e
 		if err != nil {
 			return nil, err
 		}
-		return handler.ListDirectory()
-	
-	case "FAT16", "FAT12":
-		// TODO: Implement FAT16 handler
-		return nil, ErrNotSupported
+		return handler.ListDirectory(dirPath)
 	
 	case "NTFS":
 		handler, err := filesystem.NewNTFSHandler(e, p.StartSector)
 		if err != nil {
 			return nil, err
 		}
-		return handler.ListDirectory()
-		
-	case "ext4":
-		handler, err := filesystem.NewExt4Handler(e, p.StartSector)
-		if err != nil {
-			return nil, err
-		}
-		return handler.ListDirectory()
+		// NTFS - only root for now
+		return handler.ListDirectory(dirPath)
 		
 	default:
 		return nil, ErrNotSupported
 	}
-}
-
-// ListDirectory lists files in a specific directory path within a partition.
-func (e *EWFImage) ListDirectory(partitionIndex int, dirPath string) ([]filesystem.DirectoryEntry, error) {
-	// Currently only supports root directory
-	if dirPath != "" && dirPath != "/" {
-		return nil, ErrNotSupported
-	}
-	return e.ListFiles(partitionIndex)
 }
 
 // Common errors

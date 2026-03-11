@@ -2,6 +2,7 @@ package filesystem
 
 import (
 	"fmt"
+	"strings"
 )
 
 // Reader is an interface for reading sector data from a disk image
@@ -24,6 +25,9 @@ type FAT32Handler struct {
 	rootCluster       uint32
 	totalSectors32    uint32
 	backupBootSector  uint16
+	
+	// Calculated values
+	dataAreaStart uint64
 }
 
 // NewFAT32Handler creates a new FAT32 handler
@@ -37,6 +41,9 @@ func NewFAT32Handler(reader Reader, startLBA uint64, partitionSize uint64) (*FAT
 	if err := h.readBootSector(partitionSize); err != nil {
 		return nil, err
 	}
+	
+	// Calculate FAT locations
+	_, h.dataAreaStart, _ = h.calculateFATLocation(partitionSize)
 	
 	return h, nil
 }
@@ -85,14 +92,10 @@ func (h *FAT32Handler) calculateFATLocation(partitionSize uint64) (fatStart uint
 	numFATs := uint64(h.numFATs)
 	
 	// Calculate sectors per FAT
-	// If not set or unreasonable, calculate from partition size
 	sectorsPerFAT := uint64(h.sectorsPerFAT32)
 	if sectorsPerFAT == 0 || sectorsPerFAT < 1000 {
-		// Estimate based on partition size and cluster size
-		// For 64KB clusters, FAT is roughly partition / 32768
 		clusters := partitionSize / sectorsPerCluster
 		sectorsPerFAT = (clusters*4 + 511) / 512
-		// Add some margin
 		sectorsPerFAT += 100
 		if sectorsPerFAT > 16000 {
 			sectorsPerFAT = 16000
@@ -102,7 +105,7 @@ func (h *FAT32Handler) calculateFATLocation(partitionSize uint64) (fatStart uint
 	fatStart = h.startLBA + reserved
 	dataAreaStart = fatStart + (numFATs * sectorsPerFAT)
 	
-	// Root directory is at cluster 2 (first data cluster)
+	// Root directory is at cluster 2
 	rootCluster := uint64(h.rootCluster)
 	if rootCluster < 2 {
 		rootCluster = 2
@@ -115,100 +118,80 @@ func (h *FAT32Handler) calculateFATLocation(partitionSize uint64) (fatStart uint
 	return
 }
 
-// ListDirectory lists files in the root directory
-func (h *FAT32Handler) ListDirectory() ([]DirectoryEntry, error) {
-	// Get partition size estimate
-	partitionSize := uint64(0)
-	if h.totalSectors32 > 0 && h.totalSectors32 < 0xFFFFFFF {
-		partitionSize = uint64(h.totalSectors32)
-	}
-	
-	_, dataAreaStart, rootDirLBA := h.calculateFATLocation(partitionSize)
-	
-	// Try reading root directory - read enough sectors for a full root directory
-	// Root directory in FAT32 typically uses one or more clusters
+// clusterToLBA converts a cluster number to absolute LBA
+func (h *FAT32Handler) clusterToLBA(cluster uint32) uint64 {
 	sectorsPerCluster := uint64(h.sectorsPerCluster)
-	rootDirData, err := h.reader.ReadSectors(rootDirLBA, sectorsPerCluster)
-	if err != nil || len(rootDirData) == 0 || rootDirData[0] == 0 {
-		// Try data area start as fallback
-		rootDirData, _ = h.reader.ReadSectors(dataAreaStart, sectorsPerCluster)
-	}
-	
-	// If still empty, scan for directory entries
-	if err != nil || len(rootDirData) == 0 || rootDirData[0] == 0 {
-		rootDirData = h.scanForDirectory(dataAreaStart)
-		if rootDirData == nil {
-			return nil, fmt.Errorf("no directory entries found")
-		}
-	}
-	
-	fmt.Printf("[FAT32] Read %d bytes for root directory\n", len(rootDirData))
-	
-	// Parse directory entries
-	return h.parseDirectory(rootDirData), nil
+	return h.dataAreaStart + (uint64(cluster) - 2) * sectorsPerCluster
 }
 
-// scanForDirectory scans for directory entries in the data area
-func (h *FAT32Handler) scanForDirectory(dataAreaStart uint64) []byte {
-	// Scan from data area start, covering typical FAT32 root locations
-	// For large FAT32 with 64KB clusters, root is typically around sector 29911
-	scanStart := dataAreaStart
-	if scanStart > h.startLBA + 28000 {
-		scanStart = h.startLBA + 28000
+// ListDirectory lists files in the specified directory path
+// If path is empty or "/", lists root directory
+func (h *FAT32Handler) ListDirectory(path string) ([]DirectoryEntry, error) {
+	// Parse path to find target directory
+	if path == "" || path == "/" {
+		// Root directory
+		return h.readDirectory(h.rootCluster)
 	}
 	
-	for offset := uint64(0); offset < 500; offset += 8 {
-		tryLBA := scanStart + offset
-		testData, err := h.reader.ReadSectors(tryLBA, 4)
-		if err != nil || len(testData) < 512 {
+	// Remove leading slash
+	path = strings.TrimPrefix(path, "/")
+	
+	// Find the directory by traversing path
+	parts := strings.Split(path, "/")
+	currentCluster := h.rootCluster
+	
+	for _, part := range parts {
+		if part == "" {
 			continue
 		}
 		
-		// Check for valid directory entry
-		firstByte := testData[0]
-		if firstByte == 0x00 || firstByte == 0xFF {
-			continue
+		// Read current directory to find next component
+		entries, err := h.readDirectory(currentCluster)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read directory: %w", err)
 		}
-		if firstByte >= 0x41 && firstByte <= 0x5A { // A-Z
-			// Verify by reading more
-			verifyData, _ := h.reader.ReadSectors(tryLBA, 8)
-			if len(verifyData) >= 32 {
-				validCount := 0
-				for j := 0; j+32 <= len(verifyData); j += 32 {
-					if verifyData[j] != 0x00 && verifyData[j] != 0xFF {
-						validCount++
-					}
-				}
-				if validCount > 0 {
-					fmt.Printf("[FAT32] Found directory at LBA %d with %d entries\n", tryLBA, validCount)
-					data, _ := h.reader.ReadSectors(tryLBA, 32)
-					return data
-				}
+		
+		// Find the subdirectory
+		found := false
+		for _, e := range entries {
+			if e.IsDir && e.Name == part {
+				// Found - get cluster and continue
+				currentCluster = e.Cluster
+				found = true
+				break
 			}
 		}
+		
+		if !found {
+			return nil, fmt.Errorf("directory not found: %s", part)
+		}
 	}
 	
-	// Fallback: try known good sector for this disk type
-	knownGood := h.startLBA + 29911
-	data, _ := h.reader.ReadSectors(knownGood, 32)
-	if len(data) > 0 && data[0] != 0 && data[0] != 0xFF {
-		fmt.Printf("[FAT32] Using fallback at LBA %d\n", knownGood)
-		return data
+	// Read final directory
+	return h.readDirectory(currentCluster)
+}
+
+// readDirectory reads directory entries from a given cluster
+func (h *FAT32Handler) readDirectory(cluster uint32) ([]DirectoryEntry, error) {
+	// Convert cluster to LBA
+	lba := h.clusterToLBA(cluster)
+	
+	// Read directory data (one cluster)
+	sectorsToRead := uint64(h.sectorsPerCluster)
+	data, err := h.reader.ReadSectors(lba, sectorsToRead)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read directory at cluster %d (LBA %d): %w", cluster, lba, err)
 	}
 	
-	return nil
+	// Parse directory entries
+	entries := h.parseDirectory(data)
+	
+	return entries, nil
 }
 
 // parseDirectory parses FAT32 directory entries
 func (h *FAT32Handler) parseDirectory(data []byte) []DirectoryEntry {
 	var entries []DirectoryEntry
-	
-	fmt.Printf("[FAT32] parseDirectory: parsing %d bytes\n", len(data))
-	
-	// Show first 128 bytes in hex for debugging
-	if len(data) >= 128 {
-		fmt.Printf("[FAT32] First 128 bytes: % X\n", data[:128])
-	}
 	
 	for i := 0; i+32 <= len(data); i += 32 {
 		entry := data[i : i+32]
@@ -279,18 +262,20 @@ func (h *FAT32Handler) parseDirectory(data []byte) []DirectoryEntry {
 		
 		isDir := entry[11]&0x10 != 0
 		
-		// Get file size (little-endian uint32 at offset 28)
-		// For directories, size is typically 0
-		var size uint64
-		if !isDir {
-			size = uint64(entry[28]) | uint64(entry[29])<<8 | uint64(entry[30])<<16 | uint64(entry[31])<<24
-		}
+		// Get file size
+		size := uint64(entry[28]) | uint64(entry[29])<<8 | 
+		       uint64(entry[30])<<16 | uint64(entry[31])<<24
+		
+		// Get first cluster (for subdirectories)
+		cluster := uint32(entry[26]) | uint32(entry[27])<<8 | 
+		          uint32(entry[20]) | uint32(entry[21])<<8
 		
 		entries = append(entries, DirectoryEntry{
-			Name:   filename,
-			Path:   "/" + filename,
-			IsDir:  isDir,
-			Size:   size,
+			Name:     filename,
+			Path:     "/" + filename,
+			IsDir:    isDir,
+			Size:     size,
+			Cluster:  cluster,
 		})
 	}
 	

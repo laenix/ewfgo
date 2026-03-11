@@ -48,7 +48,8 @@ func NewNTFSHandler(reader Reader, startLBA uint64) (*NTFSHandler, error) {
 }
 
 // ListDirectory lists files in the root directory
-func (h *NTFSHandler) ListDirectory() ([]DirectoryEntry, error) {
+// For NTFS, path parameter is ignored for now (only root is supported)
+func (h *NTFSHandler) ListDirectory(path string) ([]DirectoryEntry, error) {
 	// Calculate MFT sector
 	mftSector := h.startLBA + uint64(h.mftCluster*int64(h.sectorsPerCluster))
 	fmt.Printf("[NTFS] MFT sector: %d\n", mftSector)

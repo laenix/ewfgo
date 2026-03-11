@@ -10,13 +10,19 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: ewftool <path-to-e01-file> [command]")
+		fmt.Println("Usage: ewftool <path-to-e01-file> [command] [path]")
 		fmt.Println("")
 		fmt.Println("Commands:")
 		fmt.Println("  info     Show disk/partition info (default)")
 		fmt.Println("  parts    List partitions")
 		fmt.Println("  fs       Show filesystem info for each partition")
-		fmt.Println("  ls       List root directory of first partition")
+		fmt.Println("  ls       List directory (default: root)")
+		fmt.Println("")
+		fmt.Println("Examples:")
+		fmt.Println("  ewftool image.E01 ls")
+		fmt.Println("  ewftool image.E01 ls /")
+		fmt.Println("  ewftool image.E01 ls VIDEO")
+		fmt.Println("  ewftool image.E01 ls VIDEO/00")
 		os.Exit(1)
 	}
 
@@ -47,7 +53,12 @@ func main() {
 		showFilesystems(img)
 
 	case "ls":
-		listRootFiles(img)
+		// Optional path argument
+		dirPath := ""
+		if len(os.Args) >= 4 {
+			dirPath = os.Args[3]
+		}
+		listDirectory(img, dirPath)
 		// Try actual file reading too
 		testFileReading(img)
 
@@ -112,7 +123,7 @@ func showFilesystems(img *ewf.EWFImage) {
 	fmt.Println("╚═══════════════════════════════════════════════════════════════╝")
 }
 
-func listRootFiles(img *ewf.EWFImage) {
+func listDirectory(img *ewf.EWFImage, dirPath string) {
 	fmt.Println("╔═══════════════════════════════════════════════════════════════╗")
 	fmt.Println("║              Root Directory Listing                   ║")
 	fmt.Println("╠═══════════════════════════════════════════════════════════════╣")
@@ -127,10 +138,15 @@ func listRootFiles(img *ewf.EWFImage) {
 	
 	p := parts[0]
 	fmt.Printf("║ Partition %d: %s at LBA %-10d                  ║\n", p.Index, p.FileSystem, p.StartSector)
+	
+	if dirPath != "" {
+		fmt.Printf("║ Directory: %-45s ║\n", dirPath)
+	}
+	
 	fmt.Println("╠═══════════════════════════════════════════════════════════════╣")
 	
 	// Try to list files
-	entries, err := img.ListFiles(0)
+	entries, err := img.ListDirectory(0, dirPath)
 	if err != nil {
 		errStr := err.Error()
 		if len(errStr) > 48 {

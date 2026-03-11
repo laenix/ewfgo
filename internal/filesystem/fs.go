@@ -67,6 +67,8 @@ type DirectoryEntry struct {
 	Size     uint64
 	IsDir    bool
 	ModTime  int64
+	// For FAT32: cluster number for subdirectory
+	Cluster uint32
 }
 
 // FileSystem is the interface that must be implemented by filesystem handlers

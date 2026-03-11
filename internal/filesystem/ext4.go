@@ -111,8 +111,9 @@ func (h *Ext4Handler) parseSuperblock(data []byte) error {
 	return nil
 }
 
-// ListDirectory lists files in the root directory (/)
-func (h *Ext4Handler) ListDirectory() ([]DirectoryEntry, error) {
+// ListDirectory lists files in the root directory
+// For ext4, path parameter is ignored for now (only root is supported)
+func (h *Ext4Handler) ListDirectory(path string) ([]DirectoryEntry, error) {
 	// Root directory inode is typically inode 2
 	return h.readDirectory(2)
 }
