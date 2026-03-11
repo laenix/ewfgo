@@ -1,7 +1,6 @@
 package filesystem
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 )
@@ -18,6 +17,25 @@ type XFS struct {
 	volumeName     string
 
 	readFunc func(startLBA uint64, count uint64) ([]byte, error)
+}
+
+// NewXFSHandler creates a new XFS filesystem handler
+func NewXFSHandler(reader Reader, startLBA uint64) (*XFS, error) {
+	xfs := &XFS{
+		readFunc: reader.ReadSectors,
+	}
+	
+	// Read first sector to get superblock
+	sectorData, err := reader.ReadSectors(startLBA, 1)
+	if err != nil {
+		return nil, fmt.Errorf("XFS: failed to read superblock: %w", err)
+	}
+	
+	if err := xfs.Open(sectorData); err != nil {
+		return nil, err
+	}
+	
+	return xfs, nil
 }
 
 // XFS Super Block (at offset 0 of AG 0)
@@ -59,20 +77,27 @@ func (xfs *XFS) Open(sectorData []byte) error {
 		return fmt.Errorf("XFS: sector data too small")
 	}
 
-	var super XFSSuperblock
-	if err := binary.Read(bytes.NewReader(sectorData[:512]), binary.BigEndian, &super); err != nil {
-		return fmt.Errorf("XFS: failed to read superblock: %w", err)
+	// Read XFS superblock manually (big-endian)
+	// Magic at offset 0 (4 bytes)
+	magic := string(sectorData[0:4])
+	if magic != "XFSB" {
+		return fmt.Errorf("XFS: invalid magic %q", magic)
 	}
 
-	if string(super.Magic[:]) != "XFS" {
-		return fmt.Errorf("XFS: invalid magic")
-	}
-
-	xfs.blocksize = super.BlockSize
-	xfs.agblocks = super.Agblocks
-	xfs.agcount = super.Agcount
-	xfs.dirblocksize = super.Dirblocksize
-	xfs.uuid = super.UUID
+	// Block size at offset 4 (4 bytes big-endian)
+	xfs.blocksize = binary.BigEndian.Uint32(sectorData[4:8])
+	
+	// AG count at offset 32 (4 bytes big-endian)
+	xfs.agcount = binary.BigEndian.Uint32(sectorData[32:36])
+	
+	// AG blocks at offset 36 (4 bytes big-endian)
+	xfs.agblocks = binary.BigEndian.Uint32(sectorData[36:40])
+	
+	// Directory block size at offset 44 (4 bytes big-endian)
+	xfs.dirblocksize = binary.BigEndian.Uint32(sectorData[44:48])
+	
+	// UUID at offset 56 (16 bytes)
+	copy(xfs.uuid[:], sectorData[56:72])
 
 	return nil
 }

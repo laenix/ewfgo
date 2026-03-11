@@ -535,7 +535,7 @@ func DetectFileSystem(sectorData []byte) string {
 	}
 
 	// Check for XFS ("XFSB" at offset 0)
-	if len(sectorData) >= 4 && string(sectorData[:4]) == "XFS" {
+	if len(sectorData) >= 4 && string(sectorData[:4]) == "XFSB" {
 		return "XFS"
 	}
 

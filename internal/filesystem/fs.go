@@ -124,6 +124,16 @@ func DetectFileSystem(sectorData []byte) FileSystemType {
 		return FS_HFS
 	}
 
+	// Check XFS (magic "XFSB" at offset 0)
+	if len(sectorData) >= 4 && string(sectorData[0:4]) == "XFSB" {
+		return FS_XFS
+	}
+
+	// Check XFS alternate magic location
+	if len(sectorData) >= 1024+4 && string(sectorData[1024:1028]) == "XFSB" {
+		return FS_XFS
+	}
+
 	return FS_UNKNOWN
 }
 

@@ -52,6 +52,13 @@ func (e *EWFImage) ListDirectory(partitionIndex int, dirPath string) ([]filesyst
 			return nil, err
 		}
 		return handler.ListDirectory(dirPath)
+	
+	case "XFS":
+		handler, err := filesystem.NewXFSHandler(e, p.StartSector)
+		if err != nil {
+			return nil, err
+		}
+		return handler.ListDirectory(dirPath)
 		
 	default:
 		return nil, ErrNotSupported
