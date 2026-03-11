@@ -44,8 +44,11 @@ func (e *EWFImage) ListFiles(partitionIndex int) ([]filesystem.DirectoryEntry, e
 		return handler.ListDirectory()
 		
 	case "ext4":
-		// TODO: Implement ext4 handler
-		return nil, ErrNotSupported
+		handler, err := filesystem.NewExt4Handler(e, p.StartSector)
+		if err != nil {
+			return nil, err
+		}
+		return handler.ListDirectory()
 		
 	default:
 		return nil, ErrNotSupported
