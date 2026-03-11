@@ -2,10 +2,8 @@ package ewf
 
 import (
 	"bytes"
-	"compress/zlib"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 
 	"github.com/laenix/ewfgo/internal"
@@ -154,53 +152,18 @@ func (e *EWFImage) MBR() (internal.MBR, error) {
 func (e *EWFImage) GPT() (internal.GPT, error) {
 	var gpt internal.GPT
 	
-	// Check if we have sector data
-	if len(e.ewf.Sectors) == 0 || len(e.ewf.Sectors[0].TableEntry) == 0 {
-		return gpt, fmt.Errorf("no sector data available")
-	}
-	
-	// Read GPT data - need to read raw compressed data and decompress
-	sectorsStart := int64(e.ewf.Sectors[0].Address)
-	firstEntryOffset := int64(e.ewf.Sectors[0].TableEntry[0] & 0x7FFFFFFF)
-	
-	// Check if data is compressed (FTK Imager: bit31 clear = compressed)
-	bit31Set := (e.ewf.Sectors[0].TableEntry[0] & 0x80000000) != 0
-	isCompressed := !bit31Set
-	
-	var chunkStart int64
-	if isCompressed {
-		// For compressed data, table entry is absolute file offset
-		chunkStart = firstEntryOffset
-	} else {
-		// For uncompressed, add sectors section address
-		chunkStart = sectorsStart + firstEntryOffset
-	}
-	
-	// Read raw file to get compressed data
-	file, err := os.Open(e.ewf.Filepath())
+	// Use ReadSectors to properly read LBA 1 (GPT header is at LBA 1)
+	data, err := e.ReadSectors(1, 1)
 	if err != nil {
-		return gpt, fmt.Errorf("failed to open file: %w", err)
+		return gpt, fmt.Errorf("failed to read GPT header: %w", err)
 	}
-	defer file.Close()
 	
-	// Read the compressed chunk
-	compressed := make([]byte, 32768)
-	file.ReadAt(compressed, chunkStart)
-	
-	// Decompress
-	r, err := zlib.NewReader(bytes.NewReader(compressed))
-	if err != nil {
-		return gpt, fmt.Errorf("failed to decompress: %w", err)
-	}
-	decompressed, _ := io.ReadAll(r)
-	r.Close()
-	
-	// Search for GPT header in decompressed data
+	// Search for GPT header in sector data
 	found := false
-	for offset := 0; offset < len(decompressed)-8; offset += 512 {
-		if string(decompressed[offset:offset+8]) == "EFI PART" {
+	for offset := 0; offset < len(data)-8; offset += 512 {
+		if string(data[offset:offset+8]) == "EFI PART" {
 			// Parse GPT header
-			hdr := decompressed[offset:offset+92]
+			hdr := data[offset:offset+92]
 			copy(gpt.GPTHeader.Signature[:], hdr[:8])
 			gpt.GPTHeader.Version = binary.LittleEndian.Uint32(hdr[8:12])
 			gpt.GPTHeader.HeaderSize = binary.LittleEndian.Uint32(hdr[12:16])
@@ -216,23 +179,49 @@ func (e *EWFImage) GPT() (internal.GPT, error) {
 	}
 	
 	if !found {
-		return gpt, fmt.Errorf("GPT header not found in decompressed data")
+		return gpt, fmt.Errorf("GPT header not found at LBA 1")
 	}
 	
-	// Read partition table
-	partTableOffset := int(gpt.GPTHeader.PartitionStartLBA * 512)
-	if partTableOffset+128 <= len(decompressed) {
-		for i := 0; i < 128 && i*128+128 <= len(decompressed)-partTableOffset; i++ {
-			part := decompressed[partTableOffset+i*128 : partTableOffset+(i+1)*128]
-			startLBA := binary.LittleEndian.Uint64(part[32:40])
-			endLBA := binary.LittleEndian.Uint64(part[40:48])
-			if startLBA > 0 {
-				gpt.GPTPartitionTable[i].StartLBA = startLBA
-				gpt.GPTPartitionTable[i].EndLBA = endLBA
-				copy(gpt.GPTPartitionTable[i].PartitionTypeGUID[:], part[0:16])
-				copy(gpt.GPTPartitionTable[i].PartitionGUID[:], part[16:32])
-				copy(gpt.GPTPartitionTable[i].PartitionName[:], part[48:80])
-			}
+	// Read partition table (GPT uses LBA 2 for partition table by default)
+	partTableLBA := gpt.GPTHeader.PartitionStartLBA
+	if partTableLBA < 2 {
+		partTableLBA = 2 // Default partition table location
+	}
+	
+	// Read partition entries
+	partSize := int(gpt.GPTHeader.PartitionSize)
+	if partSize == 0 {
+		partSize = 128 // Default entry size
+	}
+	
+	// Read partition table sectors
+	numSectors := (uint64(gpt.GPTHeader.PartitionNumber) * uint64(partSize) + 511) / 512
+	if numSectors == 0 || numSectors > 64 {
+		numSectors = 64 // Limit to prevent excessive reads
+	}
+	
+	partData, err := e.ReadSectors(partTableLBA, numSectors)
+	if err != nil {
+		return gpt, fmt.Errorf("failed to read partition table: %w", err)
+	}
+	
+	// Parse partition entries
+	for i := 0; i < int(gpt.GPTHeader.PartitionNumber) && i < 128; i++ {
+		offset := i * partSize
+		if offset+partSize > len(partData) {
+			break
+		}
+		
+		part := partData[offset:offset+partSize]
+		startLBA := binary.LittleEndian.Uint64(part[32:40])
+		endLBA := binary.LittleEndian.Uint64(part[40:48])
+		
+		if startLBA > 0 && startLBA < 0xFFFFFFFFFFFFFFFF {
+			gpt.GPTPartitionTable[i].StartLBA = startLBA
+			gpt.GPTPartitionTable[i].EndLBA = endLBA
+			copy(gpt.GPTPartitionTable[i].PartitionTypeGUID[:], part[0:16])
+			copy(gpt.GPTPartitionTable[i].PartitionGUID[:], part[16:32])
+			copy(gpt.GPTPartitionTable[i].PartitionName[:], part[48:80])
 		}
 	}
 	
