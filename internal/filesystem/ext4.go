@@ -15,8 +15,9 @@ type Ext4Handler struct {
 	blocksPerGroup  uint32
 	inodesPerGroup  uint32
 	inodeSize       uint16
-	firstDataBlock  uint32
+	firstDataBlock  uint64
 	inodeTableStart uint64
+	bigEndian       bool
 }
 
 // NewExt4Handler creates a new ext4 handler
@@ -82,28 +83,39 @@ func (h *Ext4Handler) parseSuperblock(data []byte) error {
 		return fmt.Errorf("superblock data too small")
 	}
 	
-	// s_log_block_size (offset 0x18)
+	// Try little-endian first
 	logBlockSize := binary.LittleEndian.Uint32(data[0x18:])
 	h.blockSize = 1024 << logBlockSize
 	
-	// s_blocks_per_group (offset 0x20)
-	h.blocksPerGroup = binary.LittleEndian.Uint32(data[0x20:])
+	// Check if values make sense - if block size is unreasonable, try big-endian
+	if h.blockSize > 1024*1024 || h.blockSize < 1024 {
+		// Try big-endian instead
+		logBlockSize = binary.BigEndian.Uint32(data[0x18:])
+		h.blockSize = 1024 << logBlockSize
+		h.bigEndian = true
+	}
 	
-	// s_inodes_per_group (offset 0x28)
-	h.inodesPerGroup = binary.LittleEndian.Uint32(data[0x28:])
+	if h.bigEndian {
+		// Big-endian parsing
+		h.blocksPerGroup = binary.BigEndian.Uint32(data[0x20:])
+		h.inodesPerGroup = binary.BigEndian.Uint32(data[0x28:])
+		h.inodeSize = binary.BigEndian.Uint16(data[0x58:])
+		h.firstDataBlock = uint64(binary.BigEndian.Uint32(data[0x14:]))
+	} else {
+		// Little-endian parsing
+		h.blocksPerGroup = binary.LittleEndian.Uint32(data[0x20:])
+		h.inodesPerGroup = binary.LittleEndian.Uint32(data[0x28:])
+		h.inodeSize = binary.LittleEndian.Uint16(data[0x58:])
+		h.firstDataBlock = uint64(binary.LittleEndian.Uint32(data[0x14:]))
+	}
 	
-	// s_inode_size (offset 0x58)
-	h.inodeSize = binary.LittleEndian.Uint16(data[0x58:])
 	if h.inodeSize == 0 {
 		h.inodeSize = 128 // default
 	}
 	
-	// s_first_data_block (offset 0x14)
-	h.firstDataBlock = binary.LittleEndian.Uint32(data[0x14:])
-	
 	fmt.Printf("[ext4] Block size: %d, Blocks per group: %d, Inodes per group: %d, Inode size: %d\n",
 		h.blockSize, h.blocksPerGroup, h.inodesPerGroup, h.inodeSize)
-	fmt.Printf("[ext4] First data block: %d\n", h.firstDataBlock)
+	fmt.Printf("[ext4] First data block: %d, Big-endian: %v\n", h.firstDataBlock, h.bigEndian)
 	
 	return nil
 }
@@ -183,6 +195,8 @@ func (h *Ext4Handler) readDirectory(inodeNum uint32) ([]DirectoryEntry, error) {
 	
 	if extentMagic == 0xF30A {
 		// Extent format
+		// Extent header is 12 bytes, first extent entry starts at offset 12
+		// struct ext4_extent { ee_len(2), ee_start_hi(2), ee_start_lo(4) }
 		extent := inode[0x28:]
 		eh_entries := binary.LittleEndian.Uint16(extent[2:4])
 		eh_depth := binary.LittleEndian.Uint16(extent[6:8])
@@ -191,7 +205,7 @@ func (h *Ext4Handler) readDirectory(inodeNum uint32) ([]DirectoryEntry, error) {
 		if eh_depth == 0 && eh_entries > 0 {
 			// Leaf node - first extent starts at offset 12 (after 12-byte header)
 			ee_len := binary.LittleEndian.Uint16(extent[12:14])
-			ee_start_lo := binary.LittleEndian.Uint32(extent[14:18])
+			ee_start_lo := binary.LittleEndian.Uint32(extent[16:20]) // offset 16, not 14!
 			blockPtr = ee_start_lo
 			fmt.Printf("[ext4] Extent leaf: len=%d, block=%d\n", ee_len, blockPtr)
 		} else if eh_depth > 0 {

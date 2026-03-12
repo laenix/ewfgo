@@ -59,6 +59,13 @@ func (e *EWFImage) ListDirectory(partitionIndex int, dirPath string) ([]filesyst
 			return nil, err
 		}
 		return handler.ListDirectory(dirPath)
+	
+	case "APFS":
+		handler, err := filesystem.NewAPFSHandler(e, p.StartSector)
+		if err != nil {
+			return nil, err
+		}
+		return handler.ListDirectory(dirPath)
 		
 	default:
 		return nil, ErrNotSupported

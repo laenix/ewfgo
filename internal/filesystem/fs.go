@@ -106,14 +106,6 @@ func DetectFileSystem(sectorData []byte) FileSystemType {
 		}
 	}
 
-	// Check ext2/3/4
-	if len(sectorData) >= 0x400 {
-		magic := uint16(sectorData[0x38C]) | uint16(sectorData[0x38D])<<8
-		if magic == 0xEF53 {
-			return FS_EXT4
-		}
-	}
-
 	// Check exFAT
 	if len(sectorData) >= 11 && string(sectorData[3:11]) == "EXFAT   " {
 		return FS_EXFAT
@@ -124,14 +116,99 @@ func DetectFileSystem(sectorData []byte) FileSystemType {
 		return FS_HFS
 	}
 
-	// Check XFS (magic "XFSB" at offset 0)
-	if len(sectorData) >= 4 && string(sectorData[0:4]) == "XFSB" {
-		return FS_XFS
+	// Check XFS (magic "XFSB" at various offsets)
+	// Try offset 0, 512, 1024, 2048
+	for _, offset := range []int{0, 512, 1024, 2048, 4096} {
+		if len(sectorData) >= offset+4 && string(sectorData[offset:offset+4]) == "XFSB" {
+			// Additional validation: check if superblock fields are reasonable
+			// A real XFS superblock should have:
+			// - blocksize: power of 2, between 512 and 65536
+			// - blocks: > 0
+			// - agcount: reasonable (typically 1-100)
+			// - agblocks: reasonable (typically 1000-100000)
+			if len(sectorData) >= offset+512 {
+				blocksize := uint32(sectorData[offset+4])<<24 | uint32(sectorData[offset+5])<<16 | 
+				              uint32(sectorData[offset+6])<<8 | uint32(sectorData[offset+7])
+				blocks := uint32(sectorData[offset+8])<<24 | uint32(sectorData[offset+9])<<16 | 
+				         uint32(sectorData[offset+10])<<8 | uint32(sectorData[offset+11])
+				agcount := uint32(sectorData[offset+32])<<24 | uint32(sectorData[offset+33])<<16 | 
+				           uint32(sectorData[offset+34])<<8 | uint32(sectorData[offset+35])
+				agblocks := uint32(sectorData[offset+36])<<24 | uint32(sectorData[offset+37])<<16 | 
+				            uint32(sectorData[offset+38])<<8 | uint32(sectorData[offset+39])
+				
+				// Validate: blocksize should be power of 2 between 512-65536
+				validBlocksize := blocksize >= 512 && blocksize <= 65536 && (blocksize&(blocksize-1)) == 0
+				// blocks should be > 0
+				validBlocks := blocks > 0
+				// agcount should be reasonable (1-100)
+				validAGCount := agcount > 0 && agcount <= 100
+				// agblocks should be reasonable
+				validAGBlocks := agblocks > 100 && agblocks < 100000
+				
+				if validBlocksize && validBlocks && validAGCount && validAGBlocks {
+					return FS_XFS
+				} else {
+					// XFSB magic found but fields invalid - might be fake or corrupted
+					fmt.Printf("[FS] Warning: XFSB magic found but superblock fields invalid (blocksize=%d blocks=%d agcount=%d agblocks=%d)\n",
+						blocksize, blocks, agcount, agblocks)
+				}
+			}
+			// If we can't validate, still return XFS (backward compatibility)
+			return FS_XFS
+		}
 	}
 
-	// Check XFS alternate magic location
-	if len(sectorData) >= 1024+4 && string(sectorData[1024:1028]) == "XFSB" {
-		return FS_XFS
+	// Check ext2/3/4 (magic at offset 0x438 in the superblock)
+	// Superblock is typically at:
+	// - Offset 1024 (0x400) for 1KB block filesystems
+	// - Offset 2048 (0x800) for 2KB block filesystems  
+	// - etc.
+	// Magic (0xEF53) is at offset 0x38 within the superblock
+	for _, sbOffset := range []int{1024, 2048, 4096} {
+		if len(sectorData) >= sbOffset+0x440 {
+			magic := uint16(sectorData[sbOffset+0x438]) | uint16(sectorData[sbOffset+0x439])<<8
+			if magic == 0xEF53 {
+				return FS_EXT4
+			}
+		}
+	}
+
+	// Check Btrfs (magic "BTRFS" or "_BHRf" at offset 0x40)
+	for _, offset := range []int{64, 1024, 2048} {
+		if len(sectorData) >= offset+8 {
+			if string(sectorData[offset:offset+8]) == "BTRFS" || 
+			   string(sectorData[offset:offset+8]) == "_BHRfS_M" {
+				return FS_BTRFS
+			}
+		}
+	}
+
+	// Check SquashFS
+	if len(sectorData) >= 4 {
+		magic := uint32(sectorData[0]) | uint32(sectorData[1])<<8 | uint32(sectorData[2])<<16 | uint32(sectorData[3])<<24
+		if magic == 0x68737173 || magic == 0x73717368 { // "sqsh" or "hsqs"
+			return FS_SQUASHFS
+		}
+	}
+
+	// Check F2FS (F2FS at offset 0x400)
+	if len(sectorData) >= 1024+4 && string(sectorData[1024:1028]) == "F2FS" {
+		return FS_F2FS
+	}
+
+	// Check LUKS (magic "LUKS\xba\xbe" at offset 0)
+	if len(sectorData) >= 8 && string(sectorData[0:6]) == "LUKS" {
+		return FS_LUKS
+	}
+
+	// Check ZFS (magic "ZFS" at offset 0x84)
+	if len(sectorData) >= 136 && string(sectorData[0x84:0x88]) == "ZFS " {
+		return FS_ZFS
+	}
+
+	// Check JFS (magic "JFS1" at offset 0x8000)
+	if len(sectorData) >= 0x8004 && string(sectorData[0x8000:0x8004]) == "JFS1" {
+		return FS_JFS
 	}
 
 	return FS_UNKNOWN

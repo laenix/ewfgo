@@ -418,18 +418,52 @@ func (e *EWFImage) ReadSectorData(startSector uint64, numSectors uint64) ([]byte
 			return nil, fmt.Errorf("sector %d out of range (max chunk: %d)", sectorNum, len(tableEntry))
 		}
 
-		// Table entry offset is ALREADY the absolute file offset, not relative to sectors section!
-		chunkOffset := int64(tableEntry[chunkIndex] & 0x7FFFFFFF)
-		
-		// Standard EWF: bit31=1 means compressed, bit31=0 means uncompressed
-		rawEntry := tableEntry[chunkIndex]
-		isCompressed := (rawEntry & 0x80000000) != 0
-
-		// Read chunk directly from file (offset is absolute, not relative)
-		chunkStart := chunkOffset
+		// Table entry offset format varies between EWF files:
+		// - Some files: offset is absolute file offset
+		// - Other files: offset is relative to sectors section start
+		// We try both and use the one that gives valid data
+		tableEntryOffset := tableEntry[chunkIndex] & 0x7FFFFFFF
+		sectionFileAddress := e.Sectors[sectionIndex].Address
+		isCompressed := (tableEntry[chunkIndex] & 0x80000000) != 0
 		chunkSize := int(chunkBytes)
-		chunkData := e.ReadAt(chunkStart, int64(chunkSize))
-
+		
+		// Try both offsets
+		chunkOffset1 := int64(tableEntryOffset)
+		chunkOffset2 := chunkOffset1 + int64(sectionFileAddress)
+		
+		chunkData1 := e.ReadAt(chunkOffset1, int64(chunkSize))
+		chunkData2 := e.ReadAt(chunkOffset2, int64(chunkSize))
+		
+		// Determine which offset to use
+		chunkOffset := chunkOffset1
+		chunkData := chunkData1
+		
+		// Check which one has valid data
+		valid1 := false
+		valid2 := false
+		
+		if isCompressed {
+			// For compressed, try zlib decompress
+			_, err1 := zlib.NewReader(bytes.NewReader(chunkData1))
+			_, err2 := zlib.NewReader(bytes.NewReader(chunkData2))
+			valid1 = err1 == nil
+			valid2 = err2 == nil
+		} else {
+			// For uncompressed, check for boot sector or other valid header
+			if len(chunkData1) >= 512 {
+				valid1 = chunkData1[0] == 0xEB || chunkData1[0x1FE] == 0x55
+			}
+			if len(chunkData2) >= 512 {
+				valid2 = chunkData2[0] == 0xEB || chunkData2[0x1FE] == 0x55
+			}
+		}
+		
+		// Use offset2 if offset1 is invalid but offset2 is valid
+		if !valid1 && valid2 {
+			chunkOffset = chunkOffset2
+			chunkData = chunkData2
+		}
+		
 		if len(chunkData) == 0 {
 			return nil, fmt.Errorf("failed to read chunk at offset %d", chunkOffset)
 		}
@@ -439,13 +473,22 @@ func (e *EWFImage) ReadSectorData(startSector uint64, numSectors uint64) ([]byte
 			// Decompress using zlib
 			r, err := zlib.NewReader(bytes.NewReader(chunkData))
 			if err != nil {
-				// If decompression fails, treat as uncompressed
-				decompressed = chunkData[:chunkSize]
-			} else {
+				// Try other offset
+				if chunkOffset == chunkOffset1 && valid2 {
+					r, err = zlib.NewReader(bytes.NewReader(chunkData2))
+					if err == nil {
+						chunkOffset = chunkOffset2
+						chunkData = chunkData2
+					}
+				}
+				if err != nil {
+					decompressed = chunkData[:chunkSize]
+				}
+			}
+			if r != nil {
 				decompressed, err = io.ReadAll(r)
 				r.Close()
 				if err != nil {
-					// If read fails, use raw data
 					decompressed = chunkData[:chunkSize]
 				}
 			}
