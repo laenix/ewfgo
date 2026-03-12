@@ -1,142 +1,100 @@
-# EWF Parser 测试结果
+# EWF 工具测试结果
 
-## 测试日期
-2026-03-11
+## 测试时间
+2026-03-12 (更新)
 
-## 代码结构
-```
-/mnt/d/code/ewfgo/
-├── cmd/main.go              # CLI入口
-├── open.go                  # 外层API（分区扫描等）
-├── open_files.go            # 文件列表API（简化版）
-└── internal/
-    ├── ewf.go               # EWF核心解析
-    ├── mbr.go, gpt.go       # 分区表解析
-    └── filesystem/
-        ├── fs.go            # 文件系统接口定义
-        ├── fat32.go         # ✅ FAT32实现
-        ├── ntfs.go          # ✅ NTFS实现(已修复)
-        ├── ext4.go          # ⚠️ ext4实现(待完善)
-        └── ...其他文件系统
-```
+## 2026-03-12 修复内容
+
+### 1. FAT32 根目录 LBA 计算 Bug
+- **问题**: `sectorsPerFAT < 1000` 条件太严格，导致使用错误的 fallback 计算
+- **修复**: 将阈值从 1000 改为 100
+- **结果**: pc-disk.E01 分区2 现在正确显示 EFI 目录 (与 ewflib 完全匹配)
+
+### 2. XFS 检测 Bug - 大端序解析
+- **问题**: XFS 使用大端序 (big-endian)，但代码使用小端序解析
+- **修复**: 
+  - 修改 DetectFileSystem() 使用大端序解析 XFS 超级块字段
+  - 添加 fallback: 如果 blocksize 有效就返回 XFS
+- **结果**: server.E01, 服务器检材01-04 等文件的 XFS 现在能正确检测
+
+### 3. XFS 根 inode Fallback
+- **问题**: 部分 XFS 镜像的根 inode 字段为 0
+- **修复**: 添加 inode 128 作为 fallback (标准 XFS 根目录)
+- **结果**: 服务器检材01 等文件可以列出目录
+
+### 4. XFS inode 读取调试 (未完成)
+- **问题**: server.E01 分区1 的 inode 读取返回垃圾数据
+- **分析**: 
+  - 使用 xfs_db 从导出的原始分区镜像可以正确读取 inode 64
+  - 但 EWF 读取器返回的数据不正确
+  - 可能是 chunk 表解析问题
+- **状态**: 需要进一步调试
 
 ---
 
-## 1. video.E01 - FAT32 ✅
+## 测试结果概览
 
-### 分区信息
-- 文件系统: FAT32
-- 起始LBA: 63
-- 大小: 58.04 GB
+| # | 文件名 | 分区 | 文件系统 | 目录列表 | 状态 |
+|---|--------|------|----------|----------|------|
+| 1 | pc-disk.E01 | 1 (NTFS) | NTFS | 26 | ✅ |
+| 2 | pc-disk.E01 | 2 (FAT32) | FAT32 | 1 (EFI) | ✅ 已修复 |
+| 3 | pc-disk.E01 | 4 (NTFS) | NTFS | 244 | ✅ |
+| 4 | video.E01 | 1 (FAT32) | FAT32 | 2 | ✅ |
+| 5 | 1.计算机检材.E01 | 1 (NTFS) | NTFS | 160 | ✅ |
+| 6 | 1.计算机检材.E01 | 2 (NTFS) | NTFS | 244 | ✅ |
+| 7 | 服务器检材01.E01 | 1 (XFS) | XFS | 5 | ⚠️ |
+| 8 | server.E01 | 1 (XFS) | XFS | - | ❌ inode读取问题 |
+| 9 | server.E01 | 3 (XFS) | XFS | - | ❌ inode读取问题 |
 
-### 目录浏览测试
+---
+
+## 调试记录 - server.E01 XFS 问题
+
+### 发现
+1. 使用 `xfs_db` 从导出的原始分区镜像 (`/tmp/server_part1.img`) 可以正确读取 XFS inode
+2. 但 EWF 读取器读取相同位置返回垃圾数据
+
+### 验证步骤
 ```bash
-# 根目录
-$ ewftool video.E01 ls
-Found 2 entries:
-  [DIR ] VIDEO
-  [DIR ] SYSTEM~1
+# 导出分区
+sudo dd if=/mnt/server/ewf1 of=/tmp/server_part1.img bs=512 skip=2048 count=614400
 
-# VIDEO 目录
-$ ewftool video.E01 ls VIDEO
-Found 3 entries:
-  [DIR ] .
-  [DIR ] ..
-  [DIR ] 00
+# 使用 xfs_db 读取 - 成功
+sudo xfs_db -r /tmp/server_part1.img -c "inode 64" -c "p"
+# 输出: core.magic = 0x494e, mode = 040555 (目录)
 
-# VIDEO/00/20250416/0000-0~1 目录
-$ ewftool video.E01 ls VIDEO/00/20250416/0000-0~1
-Found 17 entries:
-  [FILE] 004745~1.TS    8266924 bytes
-  [FILE] 003530~2.TS    8961020 bytes
-  [FILE] 003659~2.TS   10058940 bytes
-  ...
+# 直接读取原始 EWF 镜像 - 失败
+sudo dd if=/mnt/d/e01/server.E01 bs=512 skip=2175 count=1 | xxd
+# 输出: 垃圾数据
+
+# 通过 EWF 读取器 - 失败
+./ewftool_test /mnt/d/e01/server.E01 ls 0
+# inode 数据全部为零
 ```
 
-**结论**: ✅ FAT32 子目录浏览完全工作，支持多级目录遍历，文件大小正确
+### 根目录 extent 信息 (从 xfs_db 获取)
+- inode 64: `u3.bmx[0] = [0,17,1,0]`
+- 目录数据在 block 17
+- block 17 相对 LBA = 17 * 8 = 136
+- 绝对 LBA = 2048 + 136 = 2184
+- 目录 magic = "XDB3" (0x58444233)
+
+### 结论
+- EWF 读取器在读取特定位置时返回垃圾数据
+- 可能与 chunk 表解析或压缩相关
+- 需要进一步调试 EWF 内部读取逻辑
 
 ---
 
-## 2. 1.计算机检材.E01 - NTFS ✅
+## 代码修改记录
 
-### 分区信息
-```
-Partition 1: NTFS/HPFS | NTFS | LBA 2048 | 549.00 MB
-Partition 2: NTFS/HPFS | NTFS | LBA 1126400 | 34.58 GB
-Partition 3: NTFS/HPFS | NTFS | LBA 73646080 | 4.88 GB
-```
+### fat32.go
+- 修改 sectorsPerFAT 阈值: 1000 → 100 (第92行)
 
-### NTFS 解析
-- MFT cluster: 46848
-- MFT sector: 376832
-- 找到 160+ 个文件/目录
+### open.go
+- 修改 XFS 检测使用大端序解析 (第566-590行)
 
-### 目录列表 (部分)
-```
-Found 160 entries:
-  $MFT, $LogFile, $Volume, $AttrDef
-  $Bitmap, $Boot, $BadClus, $Secure
-  Boot (directory)
-  bootmgr.exe.mui
-  BOOTSTAT.DAT
-  BCD
-  各种语言包 (bg-BG, da-DK, de-DE, etc.)
-  $I30 (index attribute)
-  $$TxfLogContainer00000000
-  ...
-```
-
-**结论**: ✅ NTFS 真实目录列表完成，显示用户文件和系统文件
-
----
-
-## 3. server.E01 - Linux LVM ⚠️
-
-### 分区信息
-```
-Partition 1: Linux | ext4 | LBA 2048 | 300.00 MB
-Partition 2: Linux Swap | Swap | LBA 616448 | 2.00 GB
-Partition 3: Linux | ext4 | LBA 4810752 | 117.71 GB
-```
-
-### 状态
-- 错误: ext4 superblock not found
-
-**原因**: 实际上使用的是 LVM (LVM2_member)，不是直接的 ext4 文件系统
-
----
-
-## 4. pc-disk.E01 - GPT ❌
-
-### 分区信息
-```
-Partition 1: GPT Protective | GPT | LBA 1 | 2.00 TB
-```
-
-### 状态
-- GPT 分区解析未实现
-
----
-
-## 完成的功能
-
-| 功能 | 状态 |
-|------|------|
-| FAT32 根目录列表 | ✅ |
-| FAT32 子目录浏览 | ✅ (2026-03-11) |
-| FAT32 文件大小 | ✅ |
-| NTFS 系统文件 | ✅ |
-| MBR 分区解析 | ✅ |
-| GPT 分区解析 | ❌ |
-| LVM 支持 | ❌ |
-| NTFS 真实目录 | ❌ |
-
----
-
-## 待实现功能
-
-1. ✅ ~~FAT32 子目录浏览~~ - 已完成
-2. **NTFS 真实目录列表** - 实现 $INDEX_ROOT 解析
-3. **ext4 目录列表** - 针对不同 block size 调整
-4. **GPT 分区解析** - 解析实际 GPT 分区表
-5. **LVM 支持** - 解析 LVM PV 和 LV
+### xfs.go
+- 添加 inode 128 作为根目录 fallback (第213行)
+- 扩展 extent 偏移尝试范围 (第438行)
+- 修复 inode 读取扇区计算 (第399-401行)

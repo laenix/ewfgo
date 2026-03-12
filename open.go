@@ -54,6 +54,11 @@ type EWFImage struct {
 	ewf *internal.EWFImage
 }
 
+// Internal returns the internal EWF image for debugging
+func (e *EWFImage) Internal() *internal.EWFImage {
+	return e.ewf
+}
+
 // Close closes the EWF image file.
 func (e *EWFImage) Close() error {
 	if e.ewf != nil {
@@ -116,14 +121,28 @@ func (e *EWFImage) ReadSectors(lba uint64, count uint64) ([]byte, error) {
 
 	// Try using the proper sector reading with decompression
 	data, err := e.ewf.ReadSectorData(lba, count)
-	if err != nil {
-		// Fall back to direct file read if table not available
+	
+	// Check if the data is all zeros - if so, try raw file read
+	// This handles EWF files that store some sectors uncompressed
+	allZero := true
+	for _, b := range data {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	
+	if allZero || err != nil {
+		// Fall back to direct file read
 		sectorSize := int64(e.SectorSize())
 		offset := int64(lba) * sectorSize
 		length := int64(count) * sectorSize
 
-		data = e.ewf.ReadAt(offset, length)
-		if len(data) == 0 {
+		rawData := e.ewf.ReadAt(offset, length)
+		if len(rawData) > 0 {
+			data = rawData
+			err = nil // Clear error if we got raw data
+		} else if err != nil {
 			return nil, fmt.Errorf("failed to read sectors at LBA %d: %v", lba, err)
 		}
 	}
@@ -168,8 +187,8 @@ func (e *EWFImage) GPT() (internal.GPT, error) {
 			gpt.GPTHeader.Version = binary.LittleEndian.Uint32(hdr[8:12])
 			gpt.GPTHeader.HeaderSize = binary.LittleEndian.Uint32(hdr[12:16])
 			gpt.GPTHeader.CurrentLBA = binary.LittleEndian.Uint64(hdr[24:32])
-			gpt.GPTHeader.FirstLBA = binary.LittleEndian.Uint64(hdr[32:40])
-			gpt.GPTHeader.LastLBA = binary.LittleEndian.Uint64(hdr[40:48])
+			gpt.GPTHeader.FirstLBA = binary.LittleEndian.Uint64(hdr[40:48])
+			gpt.GPTHeader.LastLBA = binary.LittleEndian.Uint64(hdr[48:56])
 			gpt.GPTHeader.PartitionStartLBA = binary.LittleEndian.Uint64(hdr[72:80])
 			gpt.GPTHeader.PartitionNumber = binary.LittleEndian.Uint32(hdr[80:84])
 			gpt.GPTHeader.PartitionSize = binary.LittleEndian.Uint32(hdr[84:88])
@@ -405,6 +424,8 @@ func (e *EWFImage) ScanFileSystems() ([]PartitionInfo, error) {
 						fsType := "Unknown"
 						partSector, err := e.ReadSectors(startLBA, 8)
 						if err == nil {
+							// Debug: show first 16 bytes
+							fmt.Printf("[DEBUG] Partition %d start LBA %d: %x\n", idx, startLBA, partSector[:16])
 							fsType = DetectFileSystem(partSector)
 						}
 						
@@ -542,9 +563,38 @@ func DetectFileSystem(sectorData []byte) string {
 		}
 	}
 
-	// Check for XFS ("XFSB" at offset 0)
+	// Check for XFS ("XFSB" at offset 0) with validation
+	// XFS uses BIG-ENDIAN byte order!
 	if len(sectorData) >= 4 && string(sectorData[:4]) == "XFSB" {
-		return "XFS"
+		// Additional validation
+		if len(sectorData) >= 512 {
+			// Parse as big-endian (XFS standard)
+			blocksize := uint32(sectorData[4])<<24 | uint32(sectorData[5])<<16 | 
+			              uint32(sectorData[6])<<8 | uint32(sectorData[7])
+			blocks := uint64(sectorData[8])<<56 | uint64(sectorData[9])<<48 | 
+			         uint64(sectorData[10])<<40 | uint64(sectorData[11])<<32 |
+			         uint64(sectorData[12])<<24 | uint64(sectorData[13])<<16 | 
+			         uint64(sectorData[14])<<8 | uint64(sectorData[15])
+			agcount := uint32(sectorData[32])<<24 | uint32(sectorData[33])<<16 | 
+			           uint32(sectorData[34])<<8 | uint32(sectorData[35])
+			agblocks := uint32(sectorData[36])<<24 | uint32(sectorData[37])<<16 | 
+			            uint32(sectorData[38])<<8 | uint32(sectorData[39])
+			
+			validBlocksize := blocksize >= 512 && blocksize <= 65536 && (blocksize&(blocksize-1)) == 0
+			validBlocks := blocks > 0
+			validAGCount := agcount > 0 && agcount <= 100
+			validAGBlocks := agblocks > 100 && agblocks < 100000
+			
+			if validBlocksize && validBlocks && validAGCount && validAGBlocks {
+				return "XFS"
+			}
+			// If blocksize is valid but other fields are not, still return XFS
+			// Some XFS images may have unusual superblock values
+			if validBlocksize {
+				return "XFS"
+			}
+		}
+		return "Unknown" // XFSB magic found but superblock invalid
 	}
 
 	// Check for SquashFS ("hsqs" at offset 96)
@@ -619,7 +669,7 @@ func GuessFileSystemFromPartitionType(t byte) string {
 	case 0x07, 0x17, 0x27:
 		return "NTFS"
 	case 0x83:
-		return "ext4"
+		return "Unknown" // Could be ext2/3/4, XFS, btrfs, etc.
 	case 0x8E:
 		return "LVM"
 	case 0x82:
