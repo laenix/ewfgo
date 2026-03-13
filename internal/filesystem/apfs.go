@@ -19,6 +19,8 @@ type APFS struct {
 	volumes        []APFSVolumeInfo
 	volumeName     string
 	catalogOid     uint64
+	encrypted      bool
+	encryptionType string
 
 	readFunc func(startLBA uint64, count uint64) ([]byte, error)
 }
@@ -75,6 +77,18 @@ func (apfs *APFS) Open(sectorData []byte) error {
 			//fmt.Printf("[APFS] Found NXSB at offset %d\n", offset)
 			apfs.blocksize = uint64(binary.LittleEndian.Uint32(sectorData[offset+4:offset+8]))
 			apfs.fsBlocksCount = binary.LittleEndian.Uint64(sectorData[offset+8:offset+16])
+			
+			// Check for encryption in NXSB features (offset 32-39)
+			if offset+40 < len(sectorData) {
+				features := binary.LittleEndian.Uint64(sectorData[offset+32:offset+40])
+				if features&0x00002000 != 0 {
+					apfs.encrypted = true
+					apfs.encryptionType = "Hardware Encryption"
+				} else if features&0x00004000 != 0 {
+					apfs.encrypted = true
+					apfs.encryptionType = "Pedantic Hardware Encryption"
+				}
+			}
 			
 			// Try to get more info from NXSB
 			// NXSB structure:
@@ -136,6 +150,16 @@ func (apfs *APFS) Open(sectorData []byte) error {
 	return nil
 }
 
+// IsEncrypted returns true if the APFS volume is encrypted
+func (apfs *APFS) IsEncrypted() bool {
+	return apfs.encrypted
+}
+
+// EncryptionType returns the type of encryption used
+func (apfs *APFS) EncryptionType() string {
+	return apfs.encryptionType
+}
+
 // NewAPFSHandler creates a new APFS filesystem handler
 func NewAPFSHandler(reader Reader, startLBA uint64) (*APFS, error) {
 	apfs := &APFS{
@@ -184,6 +208,21 @@ func (apfs *APFS) ListDirectory(path string) ([]DirectoryEntry, error) {
 		if len(data) >= 8 && string(data[0:4]) == "APSB" {
 			fmt.Printf("[APFS] Found volume superblock at block %d (LBA %d)\n", blockOffset, blockLBA)
 			
+			// Check for encryption in volume superblock
+			// APSB offset 8-15 contains features
+			if len(data) >= 16 {
+				volFeatures := binary.LittleEndian.Uint64(data[8:16])
+				// Per-volume encryption flags (APFS v2+)
+				if volFeatures&0x00000001 != 0 {
+					apfs.encrypted = true
+					apfs.encryptionType = "APFS Encryption (Data Protection)"
+				}
+				if volFeatures&0x00000002 != 0 {
+					apfs.encrypted = true
+					apfs.encryptionType = "APFS Encryption (Complete)"
+				}
+			}
+			
 			// Try to find catalog tree OID
 			if len(data) >= 112 {
 				catalogOid := binary.LittleEndian.Uint64(data[96:104])
@@ -200,9 +239,45 @@ func (apfs *APFS) ListDirectory(path string) ([]DirectoryEntry, error) {
 		}
 	}
 	
+	// If encrypted, show warning
+	if apfs.encrypted {
+		fmt.Printf("[APFS] WARNING: Volume is encrypted (%s)\n", apfs.encryptionType)
+		fmt.Printf("[APFS] Encrypted APFS cannot be read without the decryption key\n")
+	} else {
+		// Check for encryption by analyzing data entropy
+		// If catalog can't be found, check if data looks random (high entropy)
+		fmt.Printf("[APFS] Checking for encryption...\n")
+	}
+	
 	// If we can't find the catalog, try brute-force search for common patterns
 	fmt.Printf("[APFS] Falling back to brute force search...\n")
-	return apfs.bruteForceSearch()
+	entries, err := apfs.bruteForceSearch()
+	
+	// If brute force finds mostly invalid names, likely encrypted
+	if err == nil && len(entries) > 0 {
+		// Check for known macOS directory names
+		knownNames := []string{"Applications", "System", "Users", "Library", "bin", "sbin", "usr", "etc", "private", "var", "tmp"}
+		validCount := 0
+		for _, e := range entries {
+			for _, known := range knownNames {
+				if len(e.Name) >= len(known) && e.Name[:len(known)] == known {
+					validCount++
+					break
+				}
+			}
+		}
+		
+		// If we found known macOS names, it's probably not encrypted
+		// If not, likely encrypted
+		if validCount == 0 {
+			apfs.encrypted = true
+			apfs.encryptionType = "Likely Encrypted (FileVault)"
+			fmt.Printf("[APFS] WARNING: No valid macOS filenames found - likely FileVault encrypted\n")
+			fmt.Printf("[APFS] Encrypted APFS volumes cannot be read without the decryption key\n")
+		}
+	}
+	
+	return entries, err
 }
 
 // readCatalogBTree reads the APFS catalog B+tree
