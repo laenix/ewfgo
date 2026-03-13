@@ -69,6 +69,8 @@ type DirectoryEntry struct {
 	ModTime  int64
 	// For FAT32: cluster number for subdirectory
 	Cluster uint32
+	// For XFS: inode number
+	Inode uint64
 }
 
 // FileSystem is the interface that must be implemented by filesystem handlers

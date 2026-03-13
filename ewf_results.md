@@ -1,100 +1,123 @@
 # EWF 工具测试结果
 
 ## 测试时间
-2026-03-12 (更新)
-
-## 2026-03-12 修复内容
-
-### 1. FAT32 根目录 LBA 计算 Bug
-- **问题**: `sectorsPerFAT < 1000` 条件太严格，导致使用错误的 fallback 计算
-- **修复**: 将阈值从 1000 改为 100
-- **结果**: pc-disk.E01 分区2 现在正确显示 EFI 目录 (与 ewflib 完全匹配)
-
-### 2. XFS 检测 Bug - 大端序解析
-- **问题**: XFS 使用大端序 (big-endian)，但代码使用小端序解析
-- **修复**: 
-  - 修改 DetectFileSystem() 使用大端序解析 XFS 超级块字段
-  - 添加 fallback: 如果 blocksize 有效就返回 XFS
-- **结果**: server.E01, 服务器检材01-04 等文件的 XFS 现在能正确检测
-
-### 3. XFS 根 inode Fallback
-- **问题**: 部分 XFS 镜像的根 inode 字段为 0
-- **修复**: 添加 inode 128 作为 fallback (标准 XFS 根目录)
-- **结果**: 服务器检材01 等文件可以列出目录
-
-### 4. XFS inode 读取调试 (未完成)
-- **问题**: server.E01 分区1 的 inode 读取返回垃圾数据
-- **分析**: 
-  - 使用 xfs_db 从导出的原始分区镜像可以正确读取 inode 64
-  - 但 EWF 读取器返回的数据不正确
-  - 可能是 chunk 表解析问题
-- **状态**: 需要进一步调试
+2026-03-13 13:25
 
 ---
 
-## 测试结果概览
+## 测试对比总结
 
-| # | 文件名 | 分区 | 文件系统 | 目录列表 | 状态 |
-|---|--------|------|----------|----------|------|
-| 1 | pc-disk.E01 | 1 (NTFS) | NTFS | 26 | ✅ |
-| 2 | pc-disk.E01 | 2 (FAT32) | FAT32 | 1 (EFI) | ✅ 已修复 |
-| 3 | pc-disk.E01 | 4 (NTFS) | NTFS | 244 | ✅ |
-| 4 | video.E01 | 1 (FAT32) | FAT32 | 2 | ✅ |
-| 5 | 1.计算机检材.E01 | 1 (NTFS) | NTFS | 160 | ✅ |
-| 6 | 1.计算机检材.E01 | 2 (NTFS) | NTFS | 244 | ✅ |
-| 7 | 服务器检材01.E01 | 1 (XFS) | XFS | 5 | ⚠️ |
-| 8 | server.E01 | 1 (XFS) | XFS | - | ❌ inode读取问题 |
-| 9 | server.E01 | 3 (XFS) | XFS | - | ❌ inode读取问题 |
+### 与 ewflib (ewfinfo) 和 Sleuth Kit 对比
+
+| 检材 | ewfinfo | sleuthkit (fls) | ewfgo | 状态 |
+|------|---------|-----------------|-------|------|
+| 服务器检材04.E01 | ✅ | ⚠️ 无法识别XFS | ✅ 14条 | ✅ 可工作 |
+| 服务器检材一.E01 | ✅ | ❌ 无法识别XFS | ❌ 根目录失败 | ❌ 失败 |
+
+### 关键发现
+
+1. **服务器检材一.E01 无法被标准工具读取**
+   - sleuthkit 的 fls 无法识别文件系统
+   - ewfgo 也不能读取根目录
+   - ewfinfo 可以读取元数据（说明E01格式正确）
+
+2. **可能原因**
+   - XFS 超级块数据损坏或不标准
+   - inode table 位置异常
+   - 可能使用了非标准 XFS 参数
 
 ---
 
-## 调试记录 - server.E01 XFS 问题
+## 详细分析
 
-### 发现
-1. 使用 `xfs_db` 从导出的原始分区镜像 (`/tmp/server_part1.img`) 可以正确读取 XFS inode
-2. 但 EWF 读取器读取相同位置返回垃圾数据
-
-### 验证步骤
-```bash
-# 导出分区
-sudo dd if=/mnt/server/ewf1 of=/tmp/server_part1.img bs=512 skip=2048 count=614400
-
-# 使用 xfs_db 读取 - 成功
-sudo xfs_db -r /tmp/server_part1.img -c "inode 64" -c "p"
-# 输出: core.magic = 0x494e, mode = 040555 (目录)
-
-# 直接读取原始 EWF 镜像 - 失败
-sudo dd if=/mnt/d/e01/server.E01 bs=512 skip=2175 count=1 | xxd
-# 输出: 垃圾数据
-
-# 通过 EWF 读取器 - 失败
-./ewftool_test /mnt/d/e01/server.E01 ls 0
-# inode 数据全部为零
+### 服务器检材04.E01 - XFS (工作正常)
+```
+分区: Linux (0x83) 1GB + Linux LVM 39GB
+文件系统检测: XFS
+目录列表: vmlinuz*, initramfs*, System.map, config, symvers 等
+总计: 14 条目
 ```
 
-### 根目录 extent 信息 (从 xfs_db 获取)
-- inode 64: `u3.bmx[0] = [0,17,1,0]`
-- 目录数据在 block 17
-- block 17 相对 LBA = 17 * 8 = 136
-- 绝对 LBA = 2048 + 136 = 2184
-- 目录 magic = "XDB3" (0x58444233)
-
-### 结论
-- EWF 读取器在读取特定位置时返回垃圾数据
-- 可能与 chunk 表解析或压缩相关
-- 需要进一步调试 EWF 内部读取逻辑
+### 服务器检材一.E01 - XFS (无法读取)
+```
+分区: Linux (0x83) 1GB + Linux LVM 49GB  
+文件系统检测: XFS (仅检测到magic)
+目录列表: 错误 "XFS: could not find root directory"
+sleuthkit: "Cannot determine file system type"
+```
 
 ---
 
-## 代码修改记录
+## 代码分析
 
-### fat32.go
-- 修改 sectorsPerFAT 阈值: 1000 → 100 (第92行)
+### XFS 超级块解析问题
+两者的超级块都有解析问题，使用 fallback 默认值:
+- blocksize=4096 (检测到)
+- agblocks=65536 (fallback)
+- agcount=1 (fallback)
+- inodeSize=512 (fallback)
 
-### open.go
-- 修改 XFS 检测使用大端序解析 (第566-590行)
+### 根目录定位
+- 尝试 inode 64, 128, 8 → 失败 (magic 无效)
+- 回退到 brute force 遍历 inode 1-500
+- 服务器检材04.E01: 在 inode 1 找到 5 条目
+- 服务器检材一.E01: 未找到任何条目
 
-### xfs.go
-- 添加 inode 128 作为根目录 fallback (第213行)
-- 扩展 extent 偏移尝试范围 (第438行)
-- 修复 inode 读取扇区计算 (第399-401行)
+### 数据偏移分析
+- parseInlineDirectory 在 offset 0x80 查找
+- 服务器检材04.E01 找到 vmlinuz, initramfs 等 boot 文件
+- 服务器检材一.E01 数据中无匹配模式
+
+---
+
+## 已确认的问题
+
+1. ❌ XFS 超级块字段解析错误 - 使用 fallback
+2. ❌ 服务器检材一.E01 无法读取根目录
+3. ⚠️ inode table 起始位置使用硬编码 fallback
+
+---
+
+## 待解决问题
+
+### 高优先级
+1. XFS 超级块正确解析 agblocks/agcount
+2. 服务器检材一.E01 根目录读取
+
+### 中优先级
+3. XFS inode table 起始位置动态计算
+4. 非标准 XFS 格式支持
+
+---
+
+## 测试命令
+
+```bash
+# 重建工具
+cd /mnt/d/code/ewfgo/cmd && /snap/bin/go build -o /tmp/ewftool .
+
+# 查看分区
+/tmp/ewftool /mnt/d/e01/服务器检材04.E01 fs
+/tmp/ewftool /mnt/d/e01/服务器检材一.E01 fs
+
+# 列出目录
+/tmp/ewftool /mnt/d/e01/服务器检材04.E01 ls 0 ""
+/tmp/ewftool /mnt/d/e01/服务器检材一.E01 ls 0 ""
+
+# 对比 sleuthkit
+mmls -t dos /mnt/d/e01/服务器检材一.E01
+fls -o 2048 /mnt/d/e01/服务器检材一.E01
+
+# 对比 ewfinfo
+ewfinfo /mnt/d/e01/服务器检材一.E01
+```
+
+---
+
+## 参考工具
+
+- `ewfinfo` - libewf 自带信息查看
+- `mmls` - The Sleuth Kit 分区查看  
+- `fls` - The Sleuth Kit 文件列表
+- `xfs_db` - XFS 文件系统调试
+
