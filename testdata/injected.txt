@@ -1,0 +1,6 @@
+fat32
+fat16
+exfat
+ext4
+btrfs
+ntfs
