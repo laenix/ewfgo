@@ -56,6 +56,11 @@ type FileEntry struct {
 	Size    int64
 	IsDir   bool
 	ModTime int64
+	// Inode is the filesystem's native handle for this entry (inode number, MFT
+	// record, or first cluster, per handler). It lets a consumer open the entry
+	// by handle via ImageFS.OpenInode instead of re-resolving the path. 0 means
+	// the handler exposed no handle (or it is the root).
+	Inode uint64
 }
 
 // ImageFS exposes one partition's filesystem through the Evidence method set.
@@ -261,15 +266,48 @@ func (fs *ImageFS) ListDir(listingPath string) ([]FileEntry, error) {
 
 	entries := make([]FileEntry, 0, len(raw))
 	for _, e := range raw {
+		// The handler's native handle: inode for the inode-based filesystems,
+		// the first cluster for FAT/exFAT (which never set Inode). Carrying it
+		// lets OpenInode skip the path walk in the consumer.
+		ino := e.Inode
+		if ino == 0 {
+			ino = uint64(e.Cluster)
+		}
 		entries = append(entries, FileEntry{
 			Name:    e.Name,
 			Path:    path.Join(listingPath, e.Name),
 			Size:    int64(e.Size),
 			IsDir:   e.IsDir,
 			ModTime: e.ModTime,
+			Inode:   ino,
 		})
 	}
 	return entries, nil
+}
+
+// OpenInode opens a file by its handle (see FileEntry.Inode) for streaming
+// reads, skipping the path walk. It is the handle-based sibling of OpenFile,
+// with the same streaming contract; pass the Inode and Size an entry carried
+// from ListDir (size matters only to FAT/exFAT, which store it in the directory
+// entry). Errors are the same shape as OpenFile (ErrNotFound for an unknown
+// handle, ErrUnsupported when the handler has no handle-based open).
+func (fs *ImageFS) OpenInode(inode uint64, size int64) (io.ReadSeekCloser, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if fs.img == nil {
+		return nil, fmt.Errorf("filesystem closed")
+	}
+	opener, ok := fs.fs.(filesystem.InodeOpener)
+	if !ok {
+		return nil, fmt.Errorf("partition %d: handle-based reads not supported for %s: %w",
+			fs.part.Index, fs.fsType, filesystem.ErrUnsupported)
+	}
+	r, err := opener.OpenInode(inode, size)
+	if err != nil {
+		return nil, fmt.Errorf("partition %d: open inode %d: %w", fs.part.Index, inode, err)
+	}
+	return r, nil
 }
 
 // ReadFile returns the full content of the file at path.
@@ -298,8 +336,9 @@ func (fs *ImageFS) ReadFile(filePath string) ([]byte, error) {
 // files may be read concurrently, and each handle's ReadAt is safe for
 // concurrent use on that handle.
 //
-// FAT12/16/32, exFAT and NTFS implement streaming today; every other filesystem
-// returns an explicit unsupported error (errors.Is(err, ewf.ErrUnsupported)).
+// FAT12/16/32, exFAT, NTFS, ext4, XFS, Btrfs and APFS implement streaming
+// today; every other filesystem returns an explicit unsupported error
+// (errors.Is(err, ewf.ErrUnsupported)).
 func (fs *ImageFS) OpenFile(filePath string) (io.ReadSeekCloser, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()

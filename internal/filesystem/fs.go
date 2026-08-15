@@ -36,6 +36,21 @@ type FileOpener interface {
 	OpenFile(path string) (io.ReadSeekCloser, error)
 }
 
+// InodeOpener is the handle-based sibling of FileOpener. A walk that lists a
+// directory already resolves each entry to the filesystem's native handle
+// (inode, MFT record, first cluster — surfaced as DirectoryEntry.Inode /
+// .Cluster), so opening by handle avoids re-resolving the full path through
+// every directory block. On large trees that re-resolution dominates extraction
+// cost, so consumers should prefer OpenInode when the handle is available.
+//
+// size is the file's byte size as reported by the directory entry. The
+// inode-based filesystems (ext4, NTFS, APFS, Btrfs, XFS) read it from their own
+// inode/record and ignore it; FAT/exFAT need it because the FAT directory entry
+// is where the size lives.
+type InodeOpener interface {
+	OpenInode(inode uint64, size int64) (io.ReadSeekCloser, error)
+}
+
 // Reader is an interface for reading sector data from a disk image. It is the
 // seam every reader-based handler reads through; the ewf package's internal
 // decompressor satisfies it structurally.

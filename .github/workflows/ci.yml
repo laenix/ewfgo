@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        # Includes the exec-based CLI tests in cmd/ (TestMain builds the real
+        # ewftool binary and runs it against the committed fixtures).
+        run: go test ./...
+      - name: Race detector (filesystem streaming concurrency)
+        # The FAT/exFAT/NTFS/ext4 concurrent ReadAt tests are only meaningful
+        # under -race, which needs cgo (gcc is present on ubuntu runners).
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -race ./internal/filesystem/...
+      - name: Hermetic check (no platform dependence in non-test code)
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/check-hermetic.sh
+
+  build-matrix:
+    name: cross-compile 7-pair matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build matrix (7 toolchain-feasible GOOS/GOARCH pairs + native gate)
+        run: bash scripts/build-matrix.sh

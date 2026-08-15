@@ -13,6 +13,7 @@ A pure Go implementation for parsing Expert Witness Format (EWF) forensic disk i
 - ✅ Parallel chunk decompression (GOMAXPROCS workers, 256-chunk batches) with a 64 MiB decompressed-chunk LRU cache
 - ✅ MD5/SHA1 acquisition-hash verification (`StoredHashes`, `VerifyImageHash`)
 - ✅ Filesystem parsing (FAT12/16/32, exFAT, NTFS, ext4, XFS, Btrfs, APFS): list directories and read files
+- ✅ Lazy streaming file reads (`ImageFS.OpenFile` → seekable `io.ReadSeekCloser` that is also an `io.ReaderAt`), so a file is read cluster/extent by cluster/extent with memory O(read block), not O(file) — GB-scale files (SQLite databases) open without loading the whole file
 - ✅ Filesystem detection for many more (HFS+, ReFS, F2FS, SquashFS, BitLocker, LUKS, ZFS, RAID, ...)
 - ✅ Multi-partition support (MBR + GPT)
 - ✅ Multi-volume file support (E01, E02... auto-discovered)
@@ -46,6 +47,9 @@ go build -o ewftool ./cmd/main.go
 
 # List a specific directory (optionally select the partition: ls <partition#> <path>)
 ./ewftool evidence.E01 ls 0 /home
+
+# Print the build version (release builds stamp the tag)
+./ewftool -version
 ```
 
 ### Programmatic Usage
@@ -55,6 +59,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 
 	"github.com/laenix/ewfgo"
@@ -128,6 +133,32 @@ data, err := fs.ReadFile("path/to/file.txt")
 if err != nil {
 	log.Fatal(err) // explicit error, never fabricated content
 }
+
+// Streaming read: open the file once and read/seek through it lazily.
+// Each OpenFile handle is independent and its ReadAt is safe for concurrent
+// use, so several files (or several goroutines) can read in parallel. Memory
+// is O(read block), not O(file) — the path for GB-scale files such as SQLite
+// databases that ReadFile cannot hold in memory.
+rc, err := fs.OpenFile("big.db")
+if err != nil {
+	log.Fatal(err)
+}
+defer rc.Close()
+
+if ra, ok := rc.(io.ReaderAt); ok { // every streaming reader implements this
+	buf := make([]byte, 4096)
+	if _, err := ra.ReadAt(buf, 0); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// Sparse-file holes read as zeros (on-disk semantics); a missing file,
+// treating a file as a directory, or an unsupported filesystem each unwrap
+// to a sentinel error via errors.Is:
+//   errors.Is(err, ewf.ErrNotFound)      // path does not exist
+//   errors.Is(err, ewf.ErrIsDirectory)   // path is a directory, OpenFile wants a file
+//   errors.Is(err, ewf.ErrNotDirectory)  // path exists but is not a directory
+//   errors.Is(err, ewf.ErrUnsupported)   // filesystem / file type without streaming
 ```
 
 ### Verifying the acquisition hashes
@@ -145,6 +176,42 @@ fmt.Printf("MD5 match: %v, SHA1 match: %v (%d bytes hashed)\n",
 
 md5Hash, sha1Hash := img.StoredHashes() // acquisition hashes, nil if absent
 ```
+
+## Building the command-line tools
+
+The two user-facing binaries are built with plain `go build` (pure Go, no CGO):
+
+```bash
+go build -o ewftool   ./cmd/main.go      # disk / partition / filesystem CLI
+go build -o nbdserve  ./cmd/nbdserve     # read-only NBD server
+```
+
+`go build ./cmd/...` builds every command, including the development-only
+tools that are not part of a release artifact: `benchparse`/`benchread`
+(parse/read benchmarks), `sweepverify` (forensic sweep probes), and the
+`ewffixture`/`exfat-inject` fixture generators.
+
+Each binary prints its build version with `-version`; release builds stamp the
+tag at link time (`-ldflags "-X main.version=<tag>"`).
+
+## Testing
+
+The suite is hermetic: it needs nothing but the Go toolchain, and
+`go test ./...` passes on a plain machine (Windows/Linux/macOS).
+
+```bash
+go test ./...   # full suite (in-memory E01 fixtures + committed images)
+go vet ./...
+```
+
+- **CLI tests** (`cmd/main_test.go`) are exec-based: `TestMain` builds the real
+  `ewftool` binary once, then subprocesses run `info`/`fs`/`ls`/`-version`
+  against the committed fixture `testdata/e01/fat16-encase6-zlib.E01`,
+  asserting exit codes and stable output.
+- **Platform gate** (Linux/macOS shells): `scripts/build-matrix.sh` builds and
+  vets all 7 toolchain-feasible target pairs, then runs the native
+  build/vet/test gate; `scripts/check-hermetic.sh` fails on any accidental
+  platform dependence (cgo, os/exec, syscall, ...) outside test files.
 
 ## Examples
 
@@ -183,10 +250,15 @@ go run ./examples/forensic evidence.E01 /etc/hostname   # read a named file
 | RAID | ✅ | Linux MD detection |
 
 **Fully parsed (list directories + read files)** via `OpenFileSystem` →
-`ImageFS.ListDir` / `ImageFS.ReadFile`: **FAT12/16/32, exFAT, NTFS, ext4, XFS,
-Btrfs, APFS**. Every other row in the table is detection-only — recognized by
-its on-disk signature but with no file parser; requesting its filesystem
-returns an explicit error, never fabricated data.
+`ImageFS.ListDir` / `ImageFS.ReadFile` / `ImageFS.OpenFile`: **FAT12/16/32,
+exFAT, NTFS, ext4, XFS, Btrfs, APFS**. Every one of these also implements the
+streaming `OpenFile` reader; `ListDir`/`ReadFile` and `OpenFile` agree byte for
+byte. Every other row in the table is detection-only — recognized by its
+on-disk signature but with no file parser; requesting its filesystem returns
+an explicit error (`ErrUnsupported`), never fabricated data. Within the parsed
+set, a few on-disk file shapes are deliberately rejected with an explicit
+error instead of being read wrong: APFS files stored decmpfs-compressed or
+symlinks, Btrfs files whose extents are compressed or encrypted.
 
 ## API Reference
 
@@ -234,6 +306,7 @@ calls are mutex-guarded):
 | `ReadBlock(off, p)` | Read partition-relative raw bytes (may cross sectors; `io.EOF` past the end) |
 | `ListDir(path)` | List directory at `path` (`""`/`"/"` = root); each entry's `Path` is absolute |
 | `ReadFile(path)` | Return full content of the file at `path` |
+| `OpenFile(path)` | Lazy streaming reader: `io.ReadSeekCloser` + `io.ReaderAt`; independent per handle, concurrent `ReadAt`-safe; sparse holes read as zeros; sentinels unwrap via `errors.Is` |
 | `Close()` | Release the parser; further calls error |
 | `FSType()` | Resolved filesystem type |
 
@@ -245,7 +318,7 @@ ewfgo/
 ├── metadata.go     # CaseNumber / EvidenceNumber / Examiner / TotalSectors / SectorSize / GetDiskInfo
 ├── read.go         # ReadSector(s) / StoredHashes / VerifyImageHash
 ├── partition.go    # MBR / GPT / APM / BSD / LVM2 / ScanFileSystems / DetectPartitionType
-├── filesystem.go   # ImageFS: OpenFileSystem / ListDir / ReadFile (the one filesystem entry point)
+├── filesystem.go   # ImageFS: OpenFileSystem / ListDir / ReadFile / OpenFile (the one filesystem entry point)
 ├── nbd/            # Read-only NBD exporter (NewImageExporter, NewPartitionExporter)
 ├── cmd/
 │   ├── main.go     # ewftool CLI (info / parts / fs / ls)
@@ -316,6 +389,19 @@ scripts/check-hermetic.sh # greps for accidental platform dependence (cgo, os/ex
 suite runs on: golden SHA-256 hashes of the first sector of every committed
 fat32 fixture (proving byte-exact decompression across endianness), and a test
 that `\`- and `/`-separated forensic paths resolve identically.
+
+Continuous integration runs the above on every push/PR via
+`.github/workflows/ci.yml`: `go build`/`go vet`/`go test ./...` on Windows,
+Linux and macOS, plus `scripts/check-hermetic.sh` and `scripts/build-matrix.sh`
+on Linux.
+
+## Releases
+
+Tagging `v*` (e.g. `git tag v1.0.0 && git push --tags`) triggers
+`.github/workflows/release.yml`: it builds `ewftool` and `nbdserve` for the 7
+target pairs above with `-ldflags "-X main.version=<tag>"`, writes a
+`SHA256SUMS` manifest, and attaches the binaries to a GitHub Release for the
+tag. `-version` on any released binary prints the exact tag it was built from.
 
 ## Correctness (the red line)
 

@@ -78,10 +78,11 @@ type ntfsAttr struct {
 
 // ntfsFileName is a parsed $FILE_NAME attribute value.
 type ntfsFileName struct {
-	parent   uint64
-	name     string
-	flags    uint32
-	realSize uint64
+	parent    uint64
+	name      string
+	namespace uint8 // 0 POSIX, 1 Win32, 2 DOS (8.3 short), 3 Win32&DOS
+	flags     uint32
+	realSize  uint64
 }
 
 // ntfsStandardInfo is a parsed $STANDARD_INFORMATION attribute value.
@@ -119,6 +120,14 @@ type NTFSHandler struct {
 
 	indexLoaded bool
 	fileIndex   map[uint64]*ntfsIndexEntry
+	// children maps a parent MFT record to its children's record numbers, one
+	// entry per distinct parent. A record's 8.3 short name and long name in the
+	// same directory collapse to a single entry (the short name is an alias of
+	// the same record, not a second file); a hard link with names in two
+	// different directories is listed once under each parent. Built once during
+	// ensureIndex so a directory listing and a path-component lookup are
+	// O(directory size) instead of a full-MFT scan per call.
+	children map[uint64][]uint64
 }
 
 // NewNTFSHandler creates a new NTFS handler. reader is the absolute-LBA sector
@@ -365,10 +374,11 @@ func (h *NTFSHandler) parseFileName(rec []byte, a ntfsAttr) (*ntfsFileName, erro
 		units[i] = binary.LittleEndian.Uint16(val[0x42+i*2 : 0x42+i*2+2])
 	}
 	return &ntfsFileName{
-		parent:   binary.LittleEndian.Uint64(val[0:8]) & 0x0000FFFFFFFFFFFF,
-		name:     string(utf16.Decode(units)),
-		flags:    binary.LittleEndian.Uint32(val[0x38:0x3C]),
-		realSize: binary.LittleEndian.Uint64(val[0x30:0x38]),
+		parent:    binary.LittleEndian.Uint64(val[0:8]) & 0x0000FFFFFFFFFFFF,
+		name:      string(utf16.Decode(units)),
+		namespace: val[0x41],
+		flags:     binary.LittleEndian.Uint32(val[0x38:0x3C]),
+		realSize:  binary.LittleEndian.Uint64(val[0x30:0x38]),
 	}, nil
 }
 
@@ -609,6 +619,7 @@ func (h *NTFSHandler) ensureIndex() error {
 		return nil
 	}
 	h.fileIndex = make(map[uint64]*ntfsIndexEntry)
+	h.children = make(map[uint64][]uint64)
 
 	const chunk uint64 = 256 // records per bulk read
 	for start := uint64(0); start < h.recordCount; start += chunk {
@@ -660,6 +671,14 @@ func (h *NTFSHandler) ensureIndex() error {
 			}
 			if len(entry.names) > 0 {
 				h.fileIndex[recNum] = entry
+				seenParent := make(map[uint64]bool)
+				for _, fn := range entry.names {
+					if seenParent[fn.parent] {
+						continue // 8.3 short name and long name of the same record in one parent
+					}
+					seenParent[fn.parent] = true
+					h.children[fn.parent] = append(h.children[fn.parent], recNum)
+				}
 			}
 		}
 	}
@@ -672,16 +691,66 @@ func (h *NTFSHandler) ensureIndex() error {
 	return nil
 }
 
-// findChild returns the MFT record whose $FILE_NAME (parent, name) matches.
+// findChild returns the MFT record whose $FILE_NAME (parent, name) matches. It
+// scans only the parent's children (see NTFSHandler.children), never the whole
+// file index.
 func (h *NTFSHandler) findChild(parent uint64, name string) (uint64, bool) {
-	for rec, e := range h.fileIndex {
-		for _, fn := range e.names {
+	for _, rec := range h.children[parent] {
+		for _, fn := range h.fileIndex[rec].names {
 			if fn.parent == parent && fn.name == name {
 				return rec, true
 			}
 		}
 	}
 	return 0, false
+}
+
+// displayRank orders $FILE_NAME namespaces for display. DOS (8.3 short) is the
+// least preferred alias; Win32&DOS long names are the norm on Windows-created
+// filesystems.
+func displayRank(ns uint8) int {
+	switch ns {
+	case 3: // Win32&DOS long name
+		return 0
+	case 1: // Win32
+		return 1
+	case 0: // POSIX
+		return 2
+	default: // DOS (8.3 short)
+		return 3
+	}
+}
+
+// preferredName picks the display name of a record among the $FILE_NAME
+// attributes that reference parent. The 8.3 short name is an alias of the same
+// record, so the long name wins; when only a short name exists it is used.
+func preferredName(names []ntfsFileName, parent uint64) *ntfsFileName {
+	var best *ntfsFileName
+	bestRank := 4
+	for i := range names {
+		fn := &names[i]
+		if fn.parent != parent {
+			continue
+		}
+		if r := displayRank(fn.namespace); r < bestRank {
+			best, bestRank = fn, r
+		}
+	}
+	return best
+}
+
+// preferredAnyName picks the highest-priority $FILE_NAME of a record regardless
+// of parent — the long name over its 8.3 alias — for naming a record when the
+// parent is not fixed. Non-nil when names is non-empty.
+func preferredAnyName(names []ntfsFileName) *ntfsFileName {
+	var best *ntfsFileName
+	bestRank := 4
+	for i := range names {
+		if r := displayRank(names[i].namespace); r < bestRank {
+			best, bestRank = &names[i], r
+		}
+	}
+	return best
 }
 
 // resolvePath resolves a filesystem path to an MFT record number by walking
@@ -731,7 +800,7 @@ func (h *NTFSHandler) relativePath(rec, ancestor uint64) (string, bool) {
 		if !ok || len(entry.names) == 0 {
 			return "", false
 		}
-		fn := entry.names[0]
+		fn := preferredAnyName(entry.names)
 		parts = append([]string{fn.name}, parts...)
 		if fn.parent == ancestor {
 			return strings.Join(parts, "/"), true
@@ -743,7 +812,7 @@ func (h *NTFSHandler) relativePath(rec, ancestor uint64) (string, bool) {
 
 // fileInfoFromEntry builds a filesystem.FileInfo from an index entry.
 func fileInfoFromEntry(entry *ntfsIndexEntry, path string) filesystem.FileInfo {
-	fn := entry.names[0]
+	fn := preferredAnyName(entry.names)
 	mode := filesystem.ModeRegular
 	if entry.isDir {
 		mode = filesystem.ModeDir
@@ -815,27 +884,27 @@ func (h *NTFSHandler) ListDirectory(path string) ([]filesystem.DirectoryEntry, e
 	}
 
 	var out []filesystem.DirectoryEntry
-	for rec, e := range h.fileIndex {
+	for _, rec := range h.children[dirRec] {
 		if rec == dirRec {
+			continue // a directory is not its own child (NTFS "." self-parent)
+		}
+		e := h.fileIndex[rec]
+		fn := preferredName(e.names, dirRec)
+		if fn == nil {
 			continue
 		}
-		for _, fn := range e.names {
-			if fn.parent != dirRec {
-				continue
-			}
-			modTime := int64(0)
-			if e.si != nil {
-				modTime = filetimeToUnix(e.si.modTime)
-			}
-			out = append(out, filesystem.DirectoryEntry{
-				Name:    fn.name,
-				Path:    filesystem.JoinPath(path, fn.name),
-				Size:    e.dataSize,
-				IsDir:   e.isDir,
-				ModTime: modTime,
-				Inode:   rec,
-			})
+		modTime := int64(0)
+		if e.si != nil {
+			modTime = filetimeToUnix(e.si.modTime)
 		}
+		out = append(out, filesystem.DirectoryEntry{
+			Name:    fn.name,
+			Path:    filesystem.JoinPath(path, fn.name),
+			Size:    e.dataSize,
+			IsDir:   e.isDir,
+			ModTime: modTime,
+			Inode:   rec,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil

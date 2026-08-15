@@ -726,7 +726,14 @@ func (apfs *APFS) resolvePathFrom(ino uint64, parts []string, followFinal bool, 
 			}
 		}
 		if !found {
-			return 0, fmt.Errorf("APFS: %q not found in %q", part, cur)
+			// Classify the miss: a name missing under a real directory is a
+			// not-found, while a path that tries to descend through a regular file
+			// (or any non-directory inode) is a not-a-directory. Both are exported
+			// sentinels so callers such as OpenFile can route them.
+			if in, ok := apfs.index.inodes[ino]; ok && in.mode&0xf000 != 0x4000 {
+				return 0, fmt.Errorf("APFS: %q is not a directory: %w", part, filesystem.ErrNotDirectory)
+			}
+			return 0, fmt.Errorf("APFS: %q not found in %q: %w", part, cur, filesystem.ErrNotFound)
 		}
 		in, ok := apfs.index.inodes[ino]
 		if !ok || in.mode&0xf000 != 0xa000 {

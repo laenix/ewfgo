@@ -33,6 +33,21 @@ func (exfat *EXFAT) OpenFile(path string) (io.ReadSeekCloser, error) {
 	return newEXFATFileReader(exfat, entry.Cluster, entry.Size)
 }
 
+// OpenInode opens a file by its first cluster, skipping the path walk (see
+// filesystem.InodeOpener). The cluster and size come from a prior
+// ListDirectory (DirectoryEntry.Cluster, surfaced as FileEntry.Inode, and
+// .Size); the size lives in the directory entry, not in an inode, so it must
+// be passed in.
+func (exfat *EXFAT) OpenInode(inode uint64, size int64) (io.ReadSeekCloser, error) {
+	if exfat.readFunc == nil {
+		return nil, fmt.Errorf("exFAT handler has no reader")
+	}
+	if inode > 0xFFFFFFFF {
+		return nil, fmt.Errorf("exFAT: cluster %d out of range: %w", inode, filesystem.ErrNotFound)
+	}
+	return newEXFATFileReader(exfat, uint32(inode), uint64(size))
+}
+
 // exfatFileReader is a lazy, seekable reader over an exFAT file's cluster chain.
 //
 // Concurrency: ReadAt is safe for concurrent use on the same handle — the
@@ -247,3 +262,4 @@ func (r *exfatFileReader) Close() error {
 
 var _ io.ReadSeekCloser = (*exfatFileReader)(nil)
 var _ filesystem.FileOpener = (*EXFAT)(nil)
+var _ filesystem.InodeOpener = (*EXFAT)(nil)

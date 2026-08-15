@@ -32,6 +32,21 @@ func (h *FAT32Handler) OpenFile(path string) (io.ReadSeekCloser, error) {
 	return newFATFileReader(h, entry.Cluster, entry.Size)
 }
 
+// OpenInode opens a file by its start cluster, skipping the path walk (see
+// filesystem.InodeOpener). The cluster comes from a prior ListDirectory
+// (DirectoryEntry.Cluster, surfaced as FileEntry.Inode) together with the
+// directory entry's Size; a cluster of 0 with size 0 is a legitimately empty
+// file and yields an immediately-EOF reader.
+func (h *FAT32Handler) OpenInode(inode uint64, size int64) (io.ReadSeekCloser, error) {
+	if h.reader == nil {
+		return nil, fmt.Errorf("FAT handler has no reader")
+	}
+	if inode > 0xFFFFFFFF {
+		return nil, fmt.Errorf("FAT: cluster %d out of range: %w", inode, filesystem.ErrNotFound)
+	}
+	return newFATFileReader(h, uint32(inode), uint64(size))
+}
+
 // fatFileReader is a lazy, seekable reader over a FAT file's cluster chain.
 //
 // Concurrency: ReadAt is safe for concurrent use on the same handle — the

@@ -8,7 +8,17 @@ import (
 	ewf "github.com/laenix/ewfgo"
 )
 
+// version is stamped at release-build time via -ldflags "-X main.version=<tag>";
+// it defaults to "dev" for local builds.
+var version = "dev"
+
 func main() {
+	// `ewftool -version` prints the build version and exits cleanly.
+	if len(os.Args) == 2 && (os.Args[1] == "-version" || os.Args[1] == "--version") {
+		fmt.Printf("ewftool %s\n", version)
+		return
+	}
+
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: ewftool <path-to-e01-file> [command] [path]")
 		fmt.Println("")
@@ -68,6 +78,7 @@ func main() {
 	default:
 		fmt.Println("Unknown command:", command)
 		fmt.Println("Available: info, parts, fs, ls")
+		os.Exit(1)
 	}
 }
 

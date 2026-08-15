@@ -928,7 +928,14 @@ func (btrfs *Btrfs) resolveInodeFromItems(items []btrfsItem, path string) (uint6
 			}
 		}
 		if !found {
-			return 0, fmt.Errorf("btrfs: path component not found: %q", part)
+			// Classify the miss: a name missing under a real directory is a
+			// not-found, while a path that tries to descend through a regular
+			// file (or any non-directory inode) is a not-a-directory. Both are
+			// exported sentinels so callers such as OpenFile can route them.
+			if in, ok := btrfs.fsInodes[inode]; ok && (in.mode&0xF000) != 0x4000 {
+				return 0, fmt.Errorf("btrfs: %q is not a directory: %w", part, filesystem.ErrNotDirectory)
+			}
+			return 0, fmt.Errorf("btrfs: path component not found: %q: %w", part, filesystem.ErrNotFound)
 		}
 	}
 	return inode, nil

@@ -5,6 +5,7 @@ package ext4
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -31,6 +32,13 @@ const (
 	// ext4MaxSearchCount bounds the number of results SearchFiles may return.
 	ext4MaxSearchCount = 100000
 )
+
+// errExt4Hole marks a logical block with no extent mapping but a logical block
+// inside the file's declared size. ext4 defines such blocks as sparse holes:
+// they read as zero bytes (lastlog/wtmp are typically mostly holes). A reader
+// distinguishes a hole from a structurally corrupt extent tree with errors.Is,
+// so a hole is zero-filled while corruption still errors.
+var errExt4Hole = errors.New("ext4: sparse hole")
 
 // Ext4Handler handles ext4 filesystem operations
 type Ext4Handler struct {
@@ -318,7 +326,7 @@ func (h *Ext4Handler) resolveExtent(nodeData []byte, fileBlock uint64, depth uin
 		return 0, fmt.Errorf("ext4: extent header entries %d exceed node capacity", ehEntries)
 	}
 	if ehEntries <= 0 {
-		return 0, fmt.Errorf("ext4: extent node has no entries")
+		return 0, fmt.Errorf("ext4: extent node has no entries: %w", errExt4Hole)
 	}
 
 	if depth == 0 {
@@ -337,7 +345,8 @@ func (h *Ext4Handler) resolveExtent(nodeData []byte, fileBlock uint64, depth uin
 				return start + (fileBlock - eeBlock), nil
 			}
 		}
-		return 0, fmt.Errorf("ext4: no extent covers file block %d", fileBlock)
+		// No extent maps this block: a sparse hole within the declared size.
+		return 0, fmt.Errorf("ext4: no extent covers file block %d: %w", fileBlock, errExt4Hole)
 	}
 
 	// Index node: pick the entry with the largest ei_block <= fileBlock, read
@@ -353,7 +362,7 @@ func (h *Ext4Handler) resolveExtent(nodeData []byte, fileBlock uint64, depth uin
 		}
 	}
 	if best < 0 {
-		return 0, fmt.Errorf("ext4: no index entry covers file block %d", fileBlock)
+		return 0, fmt.Errorf("ext4: no index entry covers file block %d: %w", fileBlock, errExt4Hole)
 	}
 	idx := nodeData[12+best*12:]
 	leafLo := uint64(binary.LittleEndian.Uint32(idx[4:8]))
@@ -450,7 +459,7 @@ func (h *Ext4Handler) readExtentData(inodeNum uint32, inodeData []byte, size uin
 func (h *Ext4Handler) resolvePathToInode(path string) (uint32, error) {
 	clean := strings.Trim(path, "/")
 	if clean == "" {
-		return 0, fmt.Errorf("ext4: root path has no file entry")
+		return 0, fmt.Errorf("ext4: root path is a directory: %w", filesystem.ErrIsDirectory)
 	}
 
 	currentInode := uint32(2) // root inode
@@ -474,13 +483,13 @@ func (h *Ext4Handler) resolvePathToInode(path string) (uint32, error) {
 			}
 		}
 		if match == nil {
-			return 0, fmt.Errorf("ext4: path component %q not found", part)
+			return 0, fmt.Errorf("ext4: path component %q not found: %w", part, filesystem.ErrNotFound)
 		}
 		if i == len(parts)-1 {
 			return uint32(match.Inode), nil
 		}
 		if !match.IsDir {
-			return 0, fmt.Errorf("ext4: path component %q is not a directory", part)
+			return 0, fmt.Errorf("ext4: path component %q is not a directory: %w", part, filesystem.ErrNotDirectory)
 		}
 		currentInode = uint32(match.Inode)
 	}
@@ -512,7 +521,7 @@ func (h *Ext4Handler) readDirectory(inodeNum uint32, parentPath string) ([]files
 	}
 	mode := binary.LittleEndian.Uint16(inodeData[0x00:])
 	if mode&0x4000 == 0 {
-		return nil, fmt.Errorf("ext4: inode %d is not a directory", inodeNum)
+		return nil, fmt.Errorf("ext4: inode %d is not a directory: %w", inodeNum, filesystem.ErrNotDirectory)
 	}
 	flags := binary.LittleEndian.Uint32(inodeData[0x20:])
 	if flags&ext4ExtentsFlag == 0 {
@@ -627,7 +636,7 @@ func (h *Ext4Handler) GetFile(path string) ([]byte, error) {
 	}
 	mode := binary.LittleEndian.Uint16(inodeData[0x00:])
 	if mode&0x4000 != 0 {
-		return nil, fmt.Errorf("ext4: path %q is a directory", path)
+		return nil, fmt.Errorf("ext4: path %q is a directory: %w", path, filesystem.ErrIsDirectory)
 	}
 	// A symlink's target is the file's data: a fast symlink stores it inline in
 	// the inode's i_block area (offset 0x28, up to 60 bytes); a long one lives in

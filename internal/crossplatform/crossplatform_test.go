@@ -29,7 +29,7 @@ func fixturePath(t *testing.T, base, variant string) string {
 	return filepath.Join("..", "..", "testdata", "e01", base+"-"+variant+".E01")
 }
 
-// supportedGOOS / supportedGOARCH mirror the 8-pair build matrix in
+// supportedGOOS / supportedGOARCH mirror the 7-pair build matrix in
 // scripts/build-matrix.sh. RISC-V is linux-only (Go rejects windows/riscv64 and
 // darwin/riscv64), so the host GOOS here cannot be windows/darwin when GOARCH
 // is riscv64; the shell script is the authority for that.

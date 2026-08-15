@@ -31,9 +31,29 @@ func (h *NTFSHandler) OpenFile(path string) (io.ReadSeekCloser, error) {
 	if err != nil {
 		return nil, err
 	}
+	return h.openRecord(rec)
+}
+
+// OpenInode opens a file by its MFT record number, skipping the path walk (see
+// filesystem.InodeOpener). The record must come from a prior ListDirectory
+// (DirectoryEntry.Inode); an unknown record is ErrNotFound.
+func (h *NTFSHandler) OpenInode(inode uint64, _ int64) (io.ReadSeekCloser, error) {
+	if h.reader == nil {
+		return nil, fmt.Errorf("NTFS handler has no reader")
+	}
+	if err := h.ensureIndex(); err != nil {
+		return nil, err
+	}
+	if _, ok := h.fileIndex[inode]; !ok {
+		return nil, fmt.Errorf("NTFS: record %d not found: %w", inode, filesystem.ErrNotFound)
+	}
+	return h.openRecord(inode)
+}
+
+func (h *NTFSHandler) openRecord(rec uint64) (io.ReadSeekCloser, error) {
 	entry := h.fileIndex[rec]
 	if entry.isDir {
-		return nil, fmt.Errorf("path is a directory: %s: %w", path, filesystem.ErrIsDirectory)
+		return nil, fmt.Errorf("path is a directory: %w", filesystem.ErrIsDirectory)
 	}
 
 	recBytes, err := h.readRecord(rec)
@@ -59,16 +79,23 @@ func (h *NTFSHandler) OpenFile(path string) (io.ReadSeekCloser, error) {
 			data := recBytes[a.valueOffset : a.valueOffset+int(a.valueLen)]
 			return &byteFileReader{Reader: bytes.NewReader(data)}, nil
 		}
+		if a.realSize == 0 {
+			// Zero-length non-resident stream: the run list is legitimately
+			// empty and there is no data to follow. A realSize > 0 stream with
+			// no runs is corrupt (its data would be lost), so that case still
+			// falls through to parseRuns and errors.
+			return &byteFileReader{Reader: bytes.NewReader(nil)}, nil
+		}
 		runs, err := h.parseRuns(recBytes[a.runDataOff:a.runDataEnd])
 		if err != nil {
-			return nil, fmt.Errorf("data runs for %s: %w", path, err)
+			return nil, fmt.Errorf("data runs for record %d: %w", rec, err)
 		}
 		return &ntfsFileReader{h: h, runs: runs, size: int64(a.realSize)}, nil
 	}
 	// Same classification as GetFile: an $ATTRIBUTE_LIST with no local unnamed
 	// $DATA holds its data in external records this parser does not follow.
 	if hasAttrList && !hasUnnamedData {
-		return nil, fmt.Errorf("attribute list not supported for %s: %w", path, filesystem.ErrUnsupported)
+		return nil, fmt.Errorf("attribute list not supported for record %d: %w", rec, filesystem.ErrUnsupported)
 	}
 	// No unnamed $DATA stream: the file is empty.
 	return &byteFileReader{Reader: bytes.NewReader(nil)}, nil
@@ -221,3 +248,4 @@ func (r *ntfsFileReader) Close() error {
 var _ io.ReadSeekCloser = (*ntfsFileReader)(nil)
 var _ io.ReadSeekCloser = (*byteFileReader)(nil)
 var _ filesystem.FileOpener = (*NTFSHandler)(nil)
+var _ filesystem.InodeOpener = (*NTFSHandler)(nil)

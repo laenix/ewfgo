@@ -26,6 +26,10 @@ import (
 	"github.com/laenix/ewfgo/nbd"
 )
 
+// version is stamped at release-build time via -ldflags "-X main.version=<tag>";
+// it defaults to "dev" for local builds.
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
@@ -37,7 +41,13 @@ func run() error {
 	unixPath := flag.String("unix", "", "bind a Unix domain socket at this path instead of TCP")
 	export := flag.String("export", "", "NBD export name (default: the image filename)")
 	partition := flag.Int("partition", 0, "partition index to export, 0 = the whole image")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("nbdserve %s\n", version)
+		return nil
+	}
 
 	args := flag.Args()
 	if len(args) != 1 {

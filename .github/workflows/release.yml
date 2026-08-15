@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build ewftool + nbdserve and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries for all 7 target pairs
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          build_one() {
+            local bin="$1" src="$2" os="$3" arch="$4"
+            local out="dist/${bin}-${TAG}-${os}-${arch}"
+            [ "$os" = "windows" ] && out="${out}.exe"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w -X main.version=${TAG}" \
+              -o "$out" "$src"
+          }
+          for pair in "windows amd64" "windows arm64" "linux amd64" "linux arm64" "linux riscv64" "darwin amd64" "darwin arm64"; do
+            read -r os arch <<<"$pair"
+            build_one ewftool ./cmd/main.go "$os" "$arch"
+            build_one nbdserve ./cmd/nbdserve "$os" "$arch"
+          done
+
+      - name: Write checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

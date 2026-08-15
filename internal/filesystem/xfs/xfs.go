@@ -910,7 +910,7 @@ func lookupDirEntry(entries []filesystem.DirectoryEntry, name string) (uint64, e
 			return e.Inode, nil
 		}
 	}
-	return 0, fmt.Errorf("XFS: %q not found in directory", name)
+	return 0, fmt.Errorf("XFS: %q not found in directory: %w", name, filesystem.ErrNotFound)
 }
 
 // readDirectory parses the directory data fork of an inode, dispatching on the
@@ -918,7 +918,7 @@ func lookupDirEntry(entries []filesystem.DirectoryEntry, name string) (uint64, e
 // btree (node). It returns only names actually stored on disk.
 func (xfs *XFS) readDirectory(ino []byte, inoNum uint64, dirPath string) ([]filesystem.DirectoryEntry, error) {
 	if !isDirectoryInode(ino) {
-		return nil, fmt.Errorf("XFS: inode is not a directory")
+		return nil, fmt.Errorf("XFS: inode is not a directory: %w", filesystem.ErrNotDirectory)
 	}
 	format := ino[xfsInodeFormatOffset]
 	switch format {
