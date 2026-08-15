@@ -6,26 +6,6 @@ import (
 	"fmt"
 )
 
-// PartitionType constants
-const (
-	// MBR partition types
-	MBRTypeEmpty     = 0x00
-	MBRTypeFAT12     = 0x01
-	MBRTypeFAT16     = 0x04
-	MBRTypeExtended  = 0x05
-	MBRTypeFAT16B    = 0x06
-	MBRTypeNTFS      = 0x07
-	MBRTypeFAT32     = 0x0B
-	MBRTypeFAT32X    = 0x0C
-	MBRTypeFAT16X    = 0x0E
-	MBRTypeExtendedX = 0x0F
-	MBRTypeLinux     = 0x83
-	MBRTypeLinuxSwap = 0x82
-	MBRTypeLinuxLVM  = 0x8E
-	MBRTypeGPT       = 0xEE
-	MBRTypeMS_Rsrv   = 0xDC
-)
-
 // APM - Apple Partition Map
 // Located in block 1-63 of Apple partition scheme disks
 type APMEntry struct {
@@ -87,16 +67,6 @@ type BSDPartition struct {
 
 const BSDMagic = 0x82564557
 
-// APM Partition Types
-const (
-	APMTypeApple_HFS  = "Apple_HFS"
-	APMTypeApple_APM  = "Apple_partition_map"
-	APMTypeApple_UNIX = "Apple_UNIX_SVR2"
-	APMTypeApple_Free = "Apple_Free"
-	APMTypeLinux      = "Linux"
-	APMTypeLinux_LVM  = "Linux_LVM"
-)
-
 // ParseAPM parses Apple Partition Map from the given data
 func ParseAPM(data []byte) ([]APMEntry, error) {
 	if len(data) < 512 {
@@ -140,9 +110,6 @@ func ParseBSDDisklabel(data []byte) (*BSDDisklabel, error) {
 	var label BSDDisklabel
 	// BSD disklabel is typically at offset 512 in sector 0
 	offset := 512
-	if len(data) > 1024 {
-		offset = 512
-	}
 
 	err := binary.Read(bytes.NewReader(data[offset:offset+512]), binary.LittleEndian, &label)
 	if err != nil {
@@ -176,9 +143,12 @@ type LVM2Header struct {
 
 const LVM2Signature = "_LVM2_PV"
 
-// ParseLVM2 parses LVM2 Physical Volume header
+// ParseLVM2 parses LVM2 Physical Volume header.
+// The label block lives at bytes 512..1024, so the input must be at least 1024
+// bytes — the old `len(data) < 512` guard let a 512-byte input through and then
+// sliced data[512:1024], panicking. Guard the full range instead.
 func ParseLVM2(data []byte) (*LVM2Header, error) {
-	if len(data) < 512 {
+	if len(data) < 1024 {
 		return nil, fmt.Errorf("data too small for LVM2 header")
 	}
 
@@ -195,66 +165,4 @@ func ParseLVM2(data []byte) (*LVM2Header, error) {
 	}
 
 	return &lvm, nil
-}
-
-// PrintAPM prints Apple Partition Map entries
-func PrintAPM(entries []APMEntry) {
-	fmt.Println("=== Apple Partition Map ===")
-	for i, e := range entries {
-		name := string(bytes.Trim(e.PartitionName[:], "\x00"))
-		ptype := string(bytes.Trim(e.PartitionType[:], "\x00"))
-
-		fmt.Printf("Partition %d:\n", i+1)
-		fmt.Printf("  Name: %s\n", name)
-		fmt.Printf("  Type: %s\n", ptype)
-		fmt.Printf("  Start Sector: %d\n", e.StartingSector)
-		fmt.Printf("  End Sector: %d\n", e.EndingSector)
-		fmt.Printf("  Size: %d sectors (%.2f GB)\n", e.SizeInSectors, float64(e.SizeInSectors)*512/1024/1024/1024)
-		fmt.Printf("  Attributes: 0x%08X\n", e.Attributes)
-		fmt.Println()
-	}
-}
-
-// PrintBSDDisklabel prints BSD Disklabel information
-func PrintBSDDisklabel(label *BSDDisklabel) {
-	fmt.Println("=== BSD Disklabel ===")
-	fmt.Printf("Version: %d\n", label.Version)
-	fmt.Printf("Cylinders: %d\n", label.NumCylinders)
-	fmt.Printf("Sectors/Track: %d\n", label.SectorsPerTrack)
-	fmt.Printf("Heads/Cylinder: %d\n", label.HeadsPerCyl)
-	fmt.Printf("Total Sectors: %d\n", label.NumSectors)
-	fmt.Println("Partitions:")
-
-	bsdTypeNames := map[uint8]string{
-		0:  "unused",
-		1:  "swap",
-		2:  "Version 6 Unix",
-		3:  "Version 7 Unix",
-		4:  "ext2fs",
-		5:  "4.2BSD FFS",
-		6:  "MSDOS",
-		7:  "Linux native",
-		8:  "NTFS",
-		9:  "HPFS",
-		10: "iso9660",
-		11: "boot",
-	}
-
-	for i, p := range label.Partitions {
-		if p.Size > 0 {
-			fmt.Printf("  %c: type=%d (%s), size=%d sectors, offset=%d\n",
-				'a'+uint8(i), p.Type, bsdTypeNames[p.Type], p.Size, p.Offset)
-		}
-	}
-}
-
-// PrintLVM2 prints LVM2 Physical Volume information
-func PrintLVM2(lvm *LVM2Header) {
-	fmt.Println("=== LVM2 Physical Volume ===")
-	vgName := string(bytes.Trim(lvm.VG_Name[:], "\x00"))
-	fmt.Printf("Volume Group: %s\n", vgName)
-	fmt.Printf("PV Size: %.2f GB\n", float64(lvm.PV_Size)/1024/1024/1024)
-	fmt.Printf("Data Area: offset=%d, size=%.2f GB\n", lvm.DataStart, float64(lvm.DataSize)/1024/1024/1024)
-	fmt.Printf("Metadata: offset=%d, size=%.2f MB\n", lvm.MetaStart, float64(lvm.MetaSize)/1024/1024)
-	fmt.Printf("Data Start Sector: %d\n", lvm.DataStart/512)
 }

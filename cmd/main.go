@@ -41,10 +41,7 @@ func main() {
 	// Run the selected command
 	switch command {
 	case "info":
-		// Original info output
-		if err := ewf.RunWithFile(filepath); err != nil {
-			log.Fatal(err)
-		}
+		printImageInfo(img)
 
 	case "parts":
 		showPartitions(img)
@@ -74,6 +71,60 @@ func main() {
 	}
 }
 
+// printImageInfo prints the image metadata box from the public API.
+func printImageInfo(img *ewf.EWFImage) {
+	fmt.Println("╔═══════════════════════════════════════════════════════════╗")
+	fmt.Println("║                     EWF Image Info                        ║")
+	fmt.Println("╠═══════════════════════════════════════════════════════════╣")
+
+	caseNum := img.CaseNumber()
+	if caseNum == "" {
+		caseNum = "(none)"
+	}
+	fmt.Printf("║ Case:         %-42s ║\n", caseNum)
+
+	evidenceNum := img.EvidenceNumber()
+	if evidenceNum == "" {
+		evidenceNum = "(none)"
+	}
+	fmt.Printf("║ Evidence:     %-42s ║\n", evidenceNum)
+
+	if examiner := img.Examiner(); examiner != "" {
+		fmt.Printf("║ Examiner:     %-42s ║\n", examiner)
+	}
+
+	// Disk info
+	disk := img.GetDiskInfo()
+	if disk != nil {
+		fmt.Println("╠═══════════════════════════════════════════════════════════╣")
+		fmt.Printf("║ Total Size:   %-42s ║\n", formatBytes(disk.TotalSectors*uint64(disk.SectorBytes)))
+		fmt.Printf("║ Sector Size:  %-42d bytes║\n", disk.SectorBytes)
+		fmt.Printf("║ Total Sectors: %-41d ║\n", disk.TotalSectors)
+
+		compName := []string{"None", "Good", "Best"}
+		compStr := "Unknown"
+		if int(disk.CompressionLevel) >= 0 && int(disk.CompressionLevel) < len(compName) {
+			compStr = compName[disk.CompressionLevel]
+		}
+		fmt.Printf("║ Compression:  %-42s ║\n", compStr)
+	}
+
+	// Partition / filesystem summary
+	parts, err := img.ScanFileSystems()
+	if err == nil && len(parts) > 0 {
+		fmt.Println("╠═══════════════════════════════════════════════════════════╣")
+		for i, p := range parts {
+			if i == 0 {
+				fmt.Printf("║ Partitions:   %-42s ║\n", fmt.Sprintf("%d found", len(parts)))
+			}
+			fmt.Printf("║   %d: %-10s | %-10s | %10s           ║\n",
+				p.Index, p.TypeName, p.FileSystem, formatSize(p.SizeSectors))
+		}
+	}
+
+	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
+}
+
 func showPartitions(img *ewf.EWFImage) {
 	disk := img.GetDiskInfo()
 	if disk == nil {
@@ -87,7 +138,7 @@ func showPartitions(img *ewf.EWFImage) {
 	fmt.Printf("║ Total Size:  %-45s ║\n", formatSize(disk.TotalSectors))
 	fmt.Printf("║ Block Size: %-45d ║\n", disk.SectorBytes)
 	fmt.Println("╠═══════════════════════════════════════════════════════════════╣")
-	
+
 	// Since full partition table parsing would need more work,
 	// show the basic info we can get
 	fmt.Println("║ Partition detection requires file system parsing          ║")
@@ -105,7 +156,7 @@ func showFilesystems(img *ewf.EWFImage) {
 	fmt.Println("╔═══════════════════════════════════════════════════════════════════════╗")
 	fmt.Println("║              Filesystem Detection                      ║")
 	fmt.Println("╠═══════════════════════════════════════════════════════════════════════╣")
-	
+
 	// Scan for partitions with filesystem detection
 	parts, err := img.ScanFileSystems()
 	if err != nil {
@@ -113,13 +164,13 @@ func showFilesystems(img *ewf.EWFImage) {
 	} else {
 		fmt.Println("║ Partition Table with Filesystem Detection:                     ║")
 		for _, p := range parts {
-			fmt.Printf("║   Part %d: %-8s | %-8s | %10s                     ║\n", 
+			fmt.Printf("║   Part %d: %-8s | %-8s | %10s                     ║\n",
 				p.Index, p.TypeName, p.FileSystem, formatSize(p.SizeSectors))
 		}
 	}
-	
+
 	fmt.Println("╠═══════════════════════════════════════════════════════════════════════╣")
-	
+
 	// Also show MBR info
 	mbr, err := img.MBR()
 	if err == nil {
@@ -137,7 +188,7 @@ func listDirectoryPartition(img *ewf.EWFImage, partitionIndex int, dirPath strin
 	fmt.Println("╔═══════════════════════════════════════════════════════════════╗")
 	fmt.Println("║              Root Directory Listing                   ║")
 	fmt.Println("╠═══════════════════════════════════════════════════════════════╣")
-	
+
 	// Get partition info
 	parts, err := img.ScanFileSystems()
 	if err != nil || len(parts) == 0 {
@@ -145,25 +196,37 @@ func listDirectoryPartition(img *ewf.EWFImage, partitionIndex int, dirPath strin
 		fmt.Println("╚═══════════════════════════════════════════════════════════════╝")
 		return
 	}
-	
+
 	idx := partitionIndex
 	if idx < 0 || idx >= len(parts) {
 		fmt.Printf("║ Invalid partition index %d (max %d)                          ║\n", idx, len(parts)-1)
 		fmt.Println("╚═══════════════════════════════════════════════════════════════╝")
 		return
 	}
-	
+
 	p := parts[idx]
 	fmt.Printf("║ Partition %d: %s at LBA %-10d                  ║\n", p.Index, p.FileSystem, p.StartSector)
-	
+
 	if dirPath != "" {
 		fmt.Printf("║ Directory: %-45s ║\n", dirPath)
 	}
-	
+
 	fmt.Println("╠═══════════════════════════════════════════════════════════════╣")
-	
-	// Try to list files
-	entries, err := img.ListDirectory(idx, dirPath)
+
+	// Open the partition's filesystem and list the directory through it.
+	fs, err := img.OpenFileSystem(idx)
+	if err != nil {
+		errStr := err.Error()
+		if len(errStr) > 48 {
+			errStr = errStr[:48]
+		}
+		fmt.Printf("║ Error: %-48s ║\n", errStr)
+		fmt.Println("╚═══════════════════════════════════════════════════════════════╝")
+		return
+	}
+	defer fs.Close()
+
+	entries, err := fs.ListDir(dirPath)
 	if err != nil {
 		errStr := err.Error()
 		if len(errStr) > 48 {
@@ -192,41 +255,7 @@ func listDirectoryPartition(img *ewf.EWFImage, partitionIndex int, dirPath strin
 	fmt.Println("╚═══════════════════════════════════════════════════════════════╝")
 }
 
-// Helper function to get partition type name
-func getPartitionTypeName(t byte) string {
-	names := map[byte]string{
-		0x00: "Empty",
-		0x01: "FAT12",
-		0x04: "FAT16",
-		0x05: "Extended",
-		0x06: "FAT16",
-		0x07: "NTFS/HPFS",
-		0x0B: "FAT32 CHS",
-		0x0C: "FAT32 LBA",
-		0x0E: "FAT16 LBA",
-		0x0F: "Extended LBA",
-		0x11: "Hidden FAT12",
-		0x14: "Hidden FAT16",
-		0x16: "Hidden FAT16",
-		0x1B: "Hidden FAT32",
-		0x1C: "Hidden FAT32",
-		0x1E: "Hidden FAT16 LBA",
-		0x27: "Windows RE",
-		0x82: "Linux Swap",
-		0x83: "Linux",
-		0x8E: "Linux LVM",
-		0xEE: "GPT",
-		0xEF: "EFI",
-		0xFD: "Linux RAID",
-	}
-	if name, ok := names[t]; ok {
-		return name
-	}
-	return fmt.Sprintf("Type 0x%02X", t)
-}
-
-func formatSize(sectors uint64) string {
-	bytes := sectors * 512
+func formatBytes(bytes uint64) string {
 	if bytes >= 1024*1024*1024*1024 {
 		return fmt.Sprintf("%.2f TB", float64(bytes)/1024/1024/1024/1024)
 	}
@@ -236,7 +265,11 @@ func formatSize(sectors uint64) string {
 	if bytes >= 1024*1024 {
 		return fmt.Sprintf("%.2f MB", float64(bytes)/1024/1024)
 	}
-	return fmt.Sprintf("%d KB", bytes/1024)
+	return fmt.Sprintf("%d bytes", bytes)
+}
+
+func formatSize(sectors uint64) string {
+	return formatBytes(sectors * 512)
 }
 
 func testFileReading(img *ewf.EWFImage) {
@@ -244,53 +277,53 @@ func testFileReading(img *ewf.EWFImage) {
 	fmt.Println("╔═══════════════════════════════════════════════════════════════╗")
 	fmt.Println("║              Testing File Reading                      ║")
 	fmt.Println("╠═══════════════════════════════════════════════════════════════╣")
-	
-	// First, show partition info 
+
+	// First, show partition info
 	parts, err := img.ScanFileSystems()
 	if err != nil || len(parts) == 0 {
 		fmt.Println("║ No partitions found                                         ║")
 		fmt.Println("╚═══════════════════════════════════════════════════════════════╝")
 		return
 	}
-	
+
 	for i, p := range parts {
-		fmt.Printf("║ Partition %d: %-8s | %-8s | LBA %-10d | %s    ║\n", 
+		fmt.Printf("║ Partition %d: %-8s | %-8s | LBA %-10d | %s    ║\n",
 			i+1, p.TypeName, p.FileSystem, p.StartSector, formatSize(p.SizeSectors))
 	}
-	
+
 	fmt.Println("╠═══════════════════════════════════════════════════════════════╣")
-	
+
 	// Try reading data from each partition
 	for i := range parts {
 		p := parts[i]
 		fmt.Printf("║ Reading partition %d (start LBA: %d)...                     ║\n", i+1, p.StartSector)
-		
+
 		// Read some sectors from this partition
 		data, err := img.ReadSectors(p.StartSector, 16)
 		if err != nil {
 			fmt.Printf("║   Error: %v                                          ║\n", err)
 			continue
 		}
-		
+
 		fmt.Printf("║   Read %d bytes from LBA %d                             ║\n", len(data), p.StartSector)
-		
+
 		// Show first 48 bytes as hex if we got data
 		if len(data) > 48 {
 			fmt.Print("║   First 48 bytes: ")
 			for j := 0; j < 48; j++ {
 				fmt.Printf("%02X ", data[j])
-				if (j+1) % 16 == 0 {
+				if (j+1)%16 == 0 {
 					fmt.Println("║")
 					fmt.Print("║                    ")
 				}
 			}
 			fmt.Println("║")
-			
+
 			// Check filesystem signature in the data
 			fs := ewf.DetectFileSystem(data)
 			fmt.Printf("║   Detected filesystem from partition: %s                   ║\n", fs)
 		}
 	}
-	
+
 	fmt.Println("╚═══════════════════════════════════════════════════════════════╝")
 }

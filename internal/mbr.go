@@ -1,13 +1,6 @@
 package internal
 
-import (
-	"bytes"
-	"compress/zlib"
-	"encoding/binary"
-	"fmt"
-	"io"
-)
-
+// MBR is a Master Boot Record parsed from sector 0.
 type MBR struct {
 	BootCode       [440]byte         // 引导代码（GRUB/Windows Boot Manager）
 	DiskSignature  uint32            // 磁盘签名（Windows NTFS 等使用）
@@ -23,72 +16,4 @@ type PartitionEntry struct {
 	EndCHS        [3]byte // CHS 结束地址
 	StartLBA      uint32  // 分区起始扇区（LBA逻辑寻址）
 	PartitionSize uint32  // 分区大小（扇区数）
-}
-
-func ParseMBR(ewf *EWFImage) {
-	FirstSector := ewf.ReadAt(int64(ewf.Sectors[0].Address)+76, int64(ewf.Sectors[0].TableEntry[1])-int64(ewf.Sectors[0].TableEntry[0]))
-	r, _ := zlib.NewReader(bytes.NewReader(FirstSector))
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	var mbr MBR
-	binary.Read(bytes.NewReader(buf.Bytes()[:512]), binary.LittleEndian, &mbr)
-	PrintMBR(mbr)
-}
-
-func PrintMBR(mbr MBR) {
-	// 打印BootCode (前16字节作为示例)
-	fmt.Println("BootCode (前16字节):")
-	for i := 0; i < 16; i++ {
-		fmt.Printf("%02X ", mbr.BootCode[i])
-		if (i+1)%8 == 0 {
-			fmt.Println()
-		}
-	}
-	fmt.Println("... (共440字节)")
-
-	// 打印DiskSignature
-	fmt.Printf("DiskSignature: 0x%08X\n", mbr.DiskSignature)
-
-	// 打印Reserved
-	fmt.Printf("Reserved: 0x%04X\n", mbr.Reserved)
-
-	// 打印PartitionTable
-	fmt.Println("\nPartitionTable:")
-	for i := 0; i < 4; i++ {
-		entry := mbr.PartitionTable[i]
-		fmt.Printf("\nPartition %d:\n", i+1)
-		fmt.Printf("  BootFlag: 0x%02X", entry.BootFlag)
-		if entry.BootFlag == 0x80 {
-			fmt.Print(" (可启动)\n")
-		} else {
-			fmt.Print(" (非启动)\n")
-		}
-
-		// 打印CHS地址
-		fmt.Printf("  StartCHS: %02X %02X %02X\n",
-			entry.StartCHS[0], entry.StartCHS[1], entry.StartCHS[2])
-		fmt.Printf("  PartitionType: 0x%02X", entry.PartitionType)
-		switch entry.PartitionType {
-		case 0x07:
-			fmt.Print(" (NTFS/exFAT)\n")
-		case 0x83:
-			fmt.Print(" (Linux)\n")
-		case 0xEE:
-			fmt.Print(" (GPT Protective)\n")
-		default:
-			fmt.Print(" (Other)\n")
-		}
-		fmt.Printf("  EndCHS: %02X %02X %02X\n",
-			entry.EndCHS[0], entry.EndCHS[1], entry.EndCHS[2])
-		fmt.Printf("  StartLBA: %d\n", entry.StartLBA)
-		fmt.Printf("  PartitionSize: %d sectors\n", entry.PartitionSize)
-	}
-
-	// Print BootSignature
-	fmt.Printf("\nBootSignature: 0x%04X", mbr.BootSignature)
-	if mbr.BootSignature == 0x55AA {
-		fmt.Print(" (Valid MBR)\n")
-	} else {
-		fmt.Print(" (Invalid MBR! Must be 0x55AA)\n")
-	}
 }

@@ -1,12 +1,9 @@
 package internal
 
-import (
-	"bytes"
-	"encoding/binary"
-	"fmt"
-	"unicode/utf16"
-)
+import "encoding/binary"
 
+// GPT is a parsed GUID Partition Table: the header plus up to 128 partition
+// entries.
 type GPT struct {
 	GPTHeader         GPTHeader
 	GPTPartitionTable [128]GPTPartitionTable
@@ -39,127 +36,71 @@ type GPTPartitionTable struct {
 	PartitionName     [72]byte
 }
 
-func ParseGPT(ewf *EWFImage) {
-	// Read GPT header - use correct offset formula
-	sectorsStart := int64(ewf.Sectors[0].Address)
-	firstEntryOffset := int64(ewf.Sectors[0].TableEntry[0] & 0x7FFFFFFF)
-	chunkStart := sectorsStart + firstEntryOffset
-	
-	// Read GPT header at LBA 1 (sector 1)
-	FirstSector := ewf.ReadAt(chunkStart, 512)
-	
-	// Check if GPT signature exists (might not be compressed)
-	gptData := FirstSector
-	
-	// Try to find GPT header
-	var gpt GPT
-	found := false
-	for offset := 0; offset < 4096; offset += 512 {
-		if offset+512 > len(gptData) {
-			break
-		}
-		if string(gptData[offset:offset+8]) == "EFI PART" {
-			binary.Read(bytes.NewReader(gptData[offset:offset+512]), binary.LittleEndian, &gpt.GPTHeader)
-			found = true
-			fmt.Printf("Found GPT header at offset %d\n", offset)
-			break
-		}
-	}
-	
-	if !found {
-		fmt.Println("GPT header not found")
-		return
-	}
-	
-	PrintGPT(gpt)
-}
-
-func PrintGPT(gpt GPT) {
-	// 打印GPTHeader
-	fmt.Println("GPTHeader:")
-	fmt.Printf("Signature: %s\n", string(gpt.GPTHeader.Signature[:]))
-	fmt.Printf("Version: %d\n", gpt.GPTHeader.Version)
-	fmt.Printf("HeaderSize: %d\n", gpt.GPTHeader.HeaderSize)
-	fmt.Printf("HeaderCRC: %d\n", gpt.GPTHeader.HeaderCRC)
-	fmt.Printf("Reserved: %d\n", gpt.GPTHeader.Reserved)
-	fmt.Printf("CurrentLBA: %d\n", gpt.GPTHeader.CurrentLBA)
-	fmt.Printf("BackupLBA: %d\n", gpt.GPTHeader.BackupLBA)
-	fmt.Printf("FirstLBA: %d\n", gpt.GPTHeader.FirstLBA)
-	fmt.Printf("LastLBA: %d\n", gpt.GPTHeader.LastLBA)
-
-	// 格式化GUID输出
-	fmt.Printf("GUID: ")
-	for i := 0; i < 16; i++ {
-		fmt.Printf("%02X", gpt.GPTHeader.GUID[i])
-		if i == 3 || i == 5 || i == 7 || i == 9 {
-			fmt.Printf("-")
-		}
-	}
-	fmt.Println()
-
-	fmt.Printf("PartitionStartLBA: %d\n", gpt.GPTHeader.PartitionStartLBA)
-	fmt.Printf("PartitionNumber: %d\n", gpt.GPTHeader.PartitionNumber)
-	fmt.Printf("PartitionSize: %d\n", gpt.GPTHeader.PartitionSize)
-	fmt.Printf("PartitionCRC: %d\n", gpt.GPTHeader.PartitionCRC)
-
-	// 打印Save区域
-	fmt.Printf("Save: ")
-	for i := 0; i < len(gpt.GPTHeader.Save); i++ {
-		fmt.Printf("%02X", gpt.GPTHeader.Save[i])
-		if (i+1)%16 == 0 {
-			fmt.Println()
-			if i != len(gpt.GPTHeader.Save)-1 {
-				fmt.Printf("      ")
-			}
-		}
-	}
-	fmt.Println("")
-
-	// 打印GPTPartitionTable
-	fmt.Println("GPTPartitionTable:")
-	for i := 0; i < 128; i++ {
-		entry := gpt.GPTPartitionTable[i]
-
-		// 如果是空分区则跳过
-		if entry.StartLBA == 0 && entry.EndLBA == 0 {
+// ParseGPTHeader scans headerData in 512-byte strides for the "EFI PART"
+// signature and, on a hit, fills the header fields the caller consumes.
+// Fields the caller's inline parse never read (e.g. GUID, BackupLBA) are left
+// zero, so the result is byte-identical to that parse. The 512-byte stride
+// preserves the original multi-stride scan within a single large sector.
+//
+// Known boundary: CurrentLBA is filled but is NOT used as a validity criterion —
+// a header is accepted on the signature alone, exactly as before. Deliberately
+// not tightened; any change here would alter ScanFileSystems behavior.
+//
+// It returns ok=false when no signature is found. A header whose first 92 bytes
+// (the parsed region) exceed the data is treated as not-found rather than
+// panicking on a crafted short sector.
+func ParseGPTHeader(headerData []byte) (GPTHeader, bool) {
+	var hdr GPTHeader
+	for offset := 0; offset < len(headerData)-8; offset += 512 {
+		if string(headerData[offset:offset+8]) != "EFI PART" {
 			continue
 		}
-
-		fmt.Printf("Partition %d:\n", i+1)
-		fmt.Printf("  PartitionTypeGUID: ")
-		for j := 0; j < 16; j++ {
-			fmt.Printf("%02X", entry.PartitionTypeGUID[j])
-			if j == 3 || j == 5 || j == 7 || j == 9 {
-				fmt.Printf("-")
-			}
+		if offset+92 > len(headerData) {
+			return GPTHeader{}, false
 		}
-		fmt.Println()
+		h := headerData[offset : offset+92]
+		copy(hdr.Signature[:], h[:8])
+		hdr.Version = binary.LittleEndian.Uint32(h[8:12])
+		hdr.HeaderSize = binary.LittleEndian.Uint32(h[12:16])
+		hdr.CurrentLBA = binary.LittleEndian.Uint64(h[24:32])
+		hdr.FirstLBA = binary.LittleEndian.Uint64(h[40:48])
+		hdr.LastLBA = binary.LittleEndian.Uint64(h[48:56])
+		hdr.PartitionStartLBA = binary.LittleEndian.Uint64(h[72:80])
+		hdr.PartitionNumber = binary.LittleEndian.Uint32(h[80:84])
+		hdr.PartitionSize = binary.LittleEndian.Uint32(h[84:88])
+		return hdr, true
+	}
+	return GPTHeader{}, false
+}
 
-		fmt.Printf("  PartitionGUID: ")
-		for j := 0; j < 16; j++ {
-			fmt.Printf("%02X", entry.PartitionGUID[j])
-			if j == 3 || j == 5 || j == 7 || j == 9 {
-				fmt.Printf("-")
-			}
+// ParseGPTPartitions decodes the GPT partition entries from partData into gpt,
+// mirroring the caller's semantics: entries are bounded by PartitionNumber
+// (max 128), an entry beyond partData stops the scan, and an entry with
+// StartLBA == 0 (or the all-ones value) is left empty. An entry whose declared
+// size is too small to carry the parsed fields (name region ends at offset 80)
+// is skipped rather than panicking on a crafted header.
+func ParseGPTPartitions(gpt *GPT, partData []byte) {
+	partSize := int(gpt.GPTHeader.PartitionSize)
+	if partSize == 0 {
+		partSize = 128 // Default entry size
+	}
+	for i := 0; i < int(gpt.GPTHeader.PartitionNumber) && i < 128; i++ {
+		offset := i * partSize
+		if offset+partSize > len(partData) {
+			break
 		}
-		fmt.Println()
-
-		fmt.Printf("  StartLBA: %d\n", entry.StartLBA)
-		fmt.Printf("  EndLBA: %d\n", entry.EndLBA)
-		fmt.Printf("  AttributeFlag: %x\n", entry.AttributeFlag)
-
-		// 解码UTF-16分区名
-		name := make([]uint16, 0, 36)
-		for j := 0; j < len(entry.PartitionName); j += 2 {
-			if j+1 >= len(entry.PartitionName) {
-				break
-			}
-			if entry.PartitionName[j] == 0 && entry.PartitionName[j+1] == 0 {
-				break
-			}
-			name = append(name, binary.LittleEndian.Uint16(entry.PartitionName[j:j+2]))
+		part := partData[offset : offset+partSize]
+		if len(part) < 80 {
+			continue
 		}
-		fmt.Printf("  PartitionName: %s\n", string(utf16.Decode(name)))
-		fmt.Println()
+		startLBA := binary.LittleEndian.Uint64(part[32:40])
+		endLBA := binary.LittleEndian.Uint64(part[40:48])
+		if startLBA > 0 && startLBA < 0xFFFFFFFFFFFFFFFF {
+			gpt.GPTPartitionTable[i].StartLBA = startLBA
+			gpt.GPTPartitionTable[i].EndLBA = endLBA
+			copy(gpt.GPTPartitionTable[i].PartitionTypeGUID[:], part[0:16])
+			copy(gpt.GPTPartitionTable[i].PartitionGUID[:], part[16:32])
+			copy(gpt.GPTPartitionTable[i].PartitionName[:], part[48:80])
+		}
 	}
 }
