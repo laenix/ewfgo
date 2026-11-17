@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 
 	forensic "github.com/laenix/ewfgo"
@@ -70,12 +71,12 @@ func run(imagePath string, partition int, addr, export string) error {
 		src := parts[partition-1].Source()
 		exp = nbd.NewExporter(src)
 		label = fmt.Sprintf("partition %d (%s, %s)", partition, parts[partition-1].TypeName(), parts[partition-1].Format())
-		mountDev = "/dev/nbd0"
+		mountDev = path.Join("/dev", "nbd0")
 		description = "raw volume"
 	} else {
 		exp = nbd.NewExporter(img.Source())
 		label = "whole disk"
-		mountDev = "/dev/nbd0p1"
+		mountDev = path.Join("/dev", "nbd0p1")
 		description = "disk with a partition table"
 	}
 
