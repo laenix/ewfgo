@@ -1,0 +1,510 @@
+package minix
+
+import (
+	"fmt"
+	pathpkg "path"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/laenix/ewfgo/internal/data/source"
+)
+
+const (
+	// kindLabel is the filesystem's name as listings report it.
+	kindLabel = "Minix"
+	// rootInode is the inode number the format reserves for the root.
+	rootInode = uint32(1)
+	// maxDirectoryBytes bounds one directory listing.
+	maxDirectoryBytes = 64 * 1024 * 1024
+	// maxNodes bounds the walk rather than exhausting memory.
+	maxNodes = 5_000_000
+	// maxSymlinkBytes is the longest symbolic-link target accepted.
+	maxSymlinkBytes = 4096
+)
+
+// Entry describes one name the walk found.
+type Entry struct {
+	Name string
+	// Path is the display path, `/`-separated.
+	Path string
+
+	IsDir     bool
+	IsFile    bool
+	IsSymlink bool
+
+	// Mode holds the permission and type bits exactly as recorded.
+	Mode uint16
+	UID  uint32
+	GID  uint32
+
+	// Size is a file's logical length or a directory's listing byte count.
+	Size uint64
+	// Allocated is the bytes the file's data zones allocate. It is meaningful
+	// only when AllocatedKnown is true; a zone map that did not validate
+	// leaves it unknown rather than inventing a number.
+	Allocated      uint64
+	AllocatedKnown bool
+
+	InodeNumber uint32
+	Links       uint32
+
+	// Times are UTC Unix seconds. A zero field means the writer recorded no
+	// time, and the field is left as the zero Time.
+	Atime time.Time
+	Mtime time.Time
+	Ctime time.Time
+
+	// SymlinkTarget is the recorded target when SymlinkTargetKnown is true.
+	// A target that could not be read leaves both zero.
+	SymlinkTarget      string
+	SymlinkTargetKnown bool
+
+	// Deleted is always false: Minix clears a deleted name's inode field, so
+	// the format retains no deleted name to report.
+	Deleted bool
+}
+
+// Info is the volume-level description returned by Volume.Info.
+type Info struct {
+	Type    string
+	Version string
+	// Magic is the on-disk magic word that selected the version.
+	Magic uint16
+
+	BlockSize     uint32
+	ZoneSize      uint64
+	InodeCount    uint32
+	Zones         uint32
+	FirstDataZone uint32
+
+	InodeTableBlock  uint32
+	InodeTableBlocks uint32
+
+	NameLength   int
+	DirEntrySize int
+
+	// State is the valid/error flag the writer recorded.
+	State      uint16
+	StateLabel string
+
+	Entries     int
+	Directories int
+	Files       int
+	Symlinks    int
+
+	EmptySlots     uint64
+	MalformedSlots uint64
+	DirectoryLoops uint64
+	Unreadable     uint64
+	Undecodable    uint64
+}
+
+type node struct {
+	name          string
+	path          string
+	parent        int
+	inodeNumber   uint32
+	kind          inodeKind
+	mode          uint16
+	uid           uint32
+	gid           uint32
+	size          uint64
+	links         uint32
+	atime         uint32
+	mtime         uint32
+	ctime         uint32
+	allocated     uint64
+	allocatedOK   bool
+	symlinkTarget string
+	symlinkOK     bool
+	children      []int
+}
+
+// Volume is a mounted Minix image.
+type Volume struct {
+	src    source.ByteSource
+	sb     *superblock
+	inodes []inode
+	nodes  []node
+	paths  map[string]int
+
+	emptySlots     uint64
+	malformedSlots uint64
+	directoryLoops uint64
+	unreadable     uint64
+	undecodable    uint64
+}
+
+var nextFileSourceID atomic.Uint64
+
+// Detect reports whether the source starts with a Minix filesystem.
+func Detect(src source.ByteSource) (bool, error) { return detectSuperblock(src) }
+
+// Open reads the superblock and walks every directory. Minix has no index of
+// names, so enumerating the image is the walk.
+func Open(src source.ByteSource) (*Volume, error) {
+	sb, err := readSuperblock(src)
+	if err != nil {
+		return nil, err
+	}
+	root, err := readInode(src, sb, rootInode)
+	if err != nil {
+		return nil, err
+	}
+	if root.kind != kindDirectory {
+		return nil, corruptf("inode %d is a %s, not the root directory", rootInode, root.kind.label())
+	}
+	volume := &Volume{
+		src:    src,
+		sb:     sb,
+		inodes: []inode{*root},
+		paths:  map[string]int{"/": 0},
+		nodes: []node{{
+			name:        "/",
+			path:        "/",
+			parent:      -1,
+			inodeNumber: rootInode,
+			kind:        root.kind,
+			mode:        root.mode,
+			uid:         root.uid,
+			gid:         root.gid,
+			size:        root.size,
+			links:       root.links,
+			atime:       root.atime,
+			mtime:       root.mtime,
+			ctime:       root.ctime,
+		}},
+	}
+	if root.size > 0 {
+		if err := volume.walk(); err != nil {
+			return nil, err
+		}
+	}
+	return volume, nil
+}
+
+func (v *Volume) walk() error {
+	visited := map[uint32]bool{rootInode: true}
+	queue := []int{0}
+	for len(queue) > 0 {
+		directory := queue[0]
+		queue = queue[1:]
+
+		list, err := v.directoryListing(directory)
+		if err != nil {
+			v.unreadable++
+			continue
+		}
+		v.emptySlots += list.empty
+		v.malformedSlots += list.malformed
+		parentPath := v.nodes[directory].path
+
+		for _, entry := range list.entries {
+			if entry.name == "." || entry.name == ".." {
+				continue
+			}
+			in, err := readInode(v.src, v.sb, entry.inode)
+			if err != nil {
+				v.undecodable++
+				continue
+			}
+			if len(v.nodes) >= maxNodes {
+				return corruptf("the image names more than %d entries", maxNodes)
+			}
+			path := "/" + entry.name
+			if parentPath != "/" {
+				path = parentPath + "/" + entry.name
+			}
+
+			undecodable := false
+			var allocated uint64
+			allocatedOK := false
+			if in.kind == kindFile || in.kind == kindSymlink {
+				file, err := v.fileSource(in)
+				if err != nil {
+					undecodable = true
+				} else {
+					allocated = file.allocatedBytes()
+					allocatedOK = true
+				}
+			}
+			target := ""
+			targetOK := false
+			if in.kind == kindSymlink {
+				target, targetOK = v.symlinkTarget(in)
+				if !targetOK {
+					undecodable = true
+				}
+			}
+			if undecodable {
+				v.undecodable++
+			}
+
+			child := len(v.nodes)
+			v.nodes = append(v.nodes, node{
+				name:          entry.name,
+				path:          path,
+				parent:        directory,
+				inodeNumber:   in.number,
+				kind:          in.kind,
+				mode:          in.mode,
+				uid:           in.uid,
+				gid:           in.gid,
+				size:          in.size,
+				links:         in.links,
+				atime:         in.atime,
+				mtime:         in.mtime,
+				ctime:         in.ctime,
+				allocated:     allocated,
+				allocatedOK:   allocatedOK,
+				symlinkTarget: target,
+				symlinkOK:     targetOK,
+			})
+			v.inodes = append(v.inodes, *in)
+			v.nodes[directory].children = append(v.nodes[directory].children, child)
+			v.paths[path] = child
+
+			if in.kind != kindDirectory {
+				continue
+			}
+			if visited[in.number] {
+				// A second name for a directory is a hard link the format does
+				// not allow; list it, but do not walk its contents twice.
+				v.directoryLoops++
+				continue
+			}
+			visited[in.number] = true
+			queue = append(queue, child)
+		}
+	}
+	return nil
+}
+
+func (v *Volume) directoryListing(directory int) (*listing, error) {
+	in := &v.inodes[directory]
+	size := in.size
+	if size == 0 {
+		return &listing{}, nil
+	}
+	if size > maxDirectoryBytes {
+		return nil, corruptf("directory %s declares %d listing bytes, more than %d",
+			v.nodes[directory].path, size, maxDirectoryBytes)
+	}
+	file, err := v.fileSource(in)
+	if err != nil {
+		return nil, err
+	}
+	bytes := make([]byte, int(size))
+	if _, err := file.readAt(0, bytes); err != nil {
+		return nil, err
+	}
+	return parseDir(bytes, v.sb.dirEntrySize, v.sb.nameLen, v.sb.magic)
+}
+
+func (v *Volume) fileSource(in *inode) (*fileSource, error) {
+	id := source.ID(nextFileSourceID.Add(1) + 1_000_000)
+	return newFileSource(id, v.src, v.sb, in)
+}
+
+func (v *Volume) symlinkTarget(in *inode) (string, bool) {
+	if in.size == 0 || in.size > maxSymlinkBytes {
+		return "", false
+	}
+	file, err := v.fileSource(in)
+	if err != nil {
+		return "", false
+	}
+	bytes := make([]byte, int(in.size))
+	if _, err := file.readAt(0, bytes); err != nil {
+		return "", false
+	}
+	return strings.ToValidUTF8(string(bytes), "�"), true
+}
+
+func normalizePath(path string) string {
+	if path == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return pathpkg.Clean(path)
+}
+
+func (v *Volume) lookup(path string) (int, error) {
+	index, ok := v.paths[normalizePath(path)]
+	if !ok {
+		return 0, fmt.Errorf("%w: %s", ErrPathNotFound, path)
+	}
+	return index, nil
+}
+
+func (v *Volume) entryOf(index int) Entry {
+	n := &v.nodes[index]
+	return Entry{
+		Name:               n.name,
+		Path:               n.path,
+		IsDir:              n.kind == kindDirectory,
+		IsFile:             n.kind == kindFile,
+		IsSymlink:          n.kind == kindSymlink,
+		Mode:               n.mode,
+		UID:                n.uid,
+		GID:                n.gid,
+		Size:               n.size,
+		Allocated:          n.allocated,
+		AllocatedKnown:     n.allocatedOK,
+		InodeNumber:        n.inodeNumber,
+		Links:              n.links,
+		Atime:              stampTime(n.atime),
+		Mtime:              stampTime(n.mtime),
+		Ctime:              stampTime(n.ctime),
+		SymlinkTarget:      n.symlinkTarget,
+		SymlinkTargetKnown: n.symlinkOK,
+	}
+}
+
+func stampTime(seconds uint32) time.Time {
+	if seconds == 0 {
+		return time.Time{}
+	}
+	return time.Unix(int64(seconds), 0).UTC()
+}
+
+// ListDir returns the entries of the directory at path, in stored order.
+func (v *Volume) ListDir(path string) ([]Entry, error) {
+	index, err := v.lookup(path)
+	if err != nil {
+		return nil, err
+	}
+	n := &v.nodes[index]
+	if n.kind != kindDirectory {
+		return nil, fmt.Errorf("%w: %s is a %s", ErrNotADirectory, n.path, n.kind.label())
+	}
+	entries := make([]Entry, 0, len(n.children))
+	for _, child := range n.children {
+		entries = append(entries, v.entryOf(child))
+	}
+	return entries, nil
+}
+
+// Stat returns the entry at path.
+func (v *Volume) Stat(path string) (*Entry, error) {
+	index, err := v.lookup(path)
+	if err != nil {
+		return nil, err
+	}
+	entry := v.entryOf(index)
+	return &entry, nil
+}
+
+// OpenFile opens a regular file's data.
+func (v *Volume) OpenFile(path string) (source.ByteSource, error) {
+	index, err := v.lookup(path)
+	if err != nil {
+		return nil, err
+	}
+	n := &v.nodes[index]
+	if n.kind != kindFile {
+		return nil, fmt.Errorf("%w: %s is a %s", ErrNotAFile, n.path, n.kind.label())
+	}
+	return v.fileSource(&v.inodes[index])
+}
+
+// OpenSymlink opens a symbolic link's target as a data stream.
+func (v *Volume) OpenSymlink(path string) (source.ByteSource, error) {
+	index, err := v.lookup(path)
+	if err != nil {
+		return nil, err
+	}
+	n := &v.nodes[index]
+	if n.kind != kindSymlink {
+		return nil, fmt.Errorf("%w: %s is a %s", ErrNotAFile, n.path, n.kind.label())
+	}
+	return v.fileSource(&v.inodes[index])
+}
+
+// Info returns volume-level facts.
+func (v *Volume) Info() Info {
+	directories := 0
+	symlinks := 0
+	for _, n := range v.nodes {
+		if n.kind == kindDirectory {
+			directories++
+		}
+		if n.kind == kindSymlink {
+			symlinks++
+		}
+	}
+	return Info{
+		Type:             kindLabel,
+		Version:          v.sb.version.label(),
+		Magic:            v.sb.magic,
+		BlockSize:        v.sb.blockSize,
+		ZoneSize:         v.sb.zoneSize(),
+		InodeCount:       v.sb.ninodes,
+		Zones:            v.sb.zones,
+		FirstDataZone:    v.sb.firstData,
+		InodeTableBlock:  v.sb.inodeTableBlock,
+		InodeTableBlocks: v.sb.inodeTableBlocks,
+		NameLength:       v.sb.nameLen,
+		DirEntrySize:     v.sb.dirEntrySize,
+		State:            v.sb.state,
+		StateLabel:       stateLabel(v.sb.state),
+		Entries:          len(v.nodes),
+		Directories:      directories,
+		Files:            len(v.nodes) - directories,
+		Symlinks:         symlinks,
+		EmptySlots:       v.emptySlots,
+		MalformedSlots:   v.malformedSlots,
+		DirectoryLoops:   v.directoryLoops,
+		Unreadable:       v.unreadable,
+		Undecodable:      v.undecodable,
+	}
+}
+
+// SuperblockInfo exposes the parsed superblock geometry for callers that need
+// details Info does not carry.
+type SuperblockInfo struct {
+	Version           string
+	Magic             uint16
+	InodeCount        uint32
+	Zones             uint32
+	InodeBitmapBlocks uint16
+	ZoneBitmapBlocks  uint16
+	FirstDataZone     uint32
+	LogZoneSize       uint16
+	MaxFileSize       uint32
+	State             uint16
+	BlockSize         uint32
+	ZoneSize          uint64
+	NameLength        int
+	DirEntrySize      int
+	InodeSize         int
+	InodeTableBlock   uint32
+	InodeTableBlocks  uint32
+}
+
+// Superblock returns the parsed superblock geometry.
+func (v *Volume) Superblock() SuperblockInfo {
+	sb := v.sb
+	return SuperblockInfo{
+		Version:           sb.version.label(),
+		Magic:             sb.magic,
+		InodeCount:        sb.ninodes,
+		Zones:             sb.zones,
+		InodeBitmapBlocks: sb.imap,
+		ZoneBitmapBlocks:  sb.zmap,
+		FirstDataZone:     sb.firstData,
+		LogZoneSize:       sb.logZone,
+		MaxFileSize:       sb.maxSize,
+		State:             sb.state,
+		BlockSize:         sb.blockSize,
+		ZoneSize:          sb.zoneSize(),
+		NameLength:        sb.nameLen,
+		DirEntrySize:      sb.dirEntrySize,
+		InodeSize:         sb.inodeSize,
+		InodeTableBlock:   sb.inodeTableBlock,
+		InodeTableBlocks:  sb.inodeTableBlocks,
+	}
+}

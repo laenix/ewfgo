@@ -1,0 +1,28 @@
+# Normalize source text to LF so Windows checkouts do not create spurious
+# diffs; evidence fixtures stay byte-exact.
+* text=auto eol=lf
+
+*.go     text eol=lf
+*.md     text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.sh     text eol=lf
+*.mod    text eol=lf
+*.sum    text eol=lf
+
+# Binary evidence and synthetic disk images must never be converted.
+*.E01 -text
+*.L01 -text
+*.raw -text
+*.dd  -text
+*.img -text
+*.bin -text
+*.exe -text
+*.dll -text
+*.png -text
+*.jpg -text
+*.zip -text
+*.gz  -text
+*.bz2 -text
+*.xz  -text
+*.zst -text
